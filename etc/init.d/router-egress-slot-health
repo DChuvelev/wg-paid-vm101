@@ -1,0 +1,19 @@
+#!/bin/sh /etc/rc.common
+
+START=91
+STOP=10
+USE_PROCD=1
+
+CONF="/etc/router-egress-slot-health.conf"
+
+start_service() {
+  [ -f "$CONF" ] && . "$CONF"
+  MODE="${MODE:---dry-run}"
+  INTERVAL="${INTERVAL:-60}"
+  LOG="${LOG:-/var/log/router-egress-slot-health.log}"
+
+  procd_open_instance
+  procd_set_param command /bin/sh -c "while true; do /usr/local/sbin/router-egress-slot-health.sh \"$MODE\" >> \"$LOG\" 2>&1; sleep \"$INTERVAL\"; done"
+  procd_set_param respawn 5 5 0
+  procd_close_instance
+}

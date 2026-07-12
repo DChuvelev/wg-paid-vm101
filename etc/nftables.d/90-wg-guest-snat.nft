@@ -1,0 +1,5 @@
+chain wg_guest_snat {
+    type nat hook postrouting priority 99; policy accept;
+
+    iifname "eth0" oifname "eth2" ip daddr 192.168.30.189 udp dport 51821 counter snat ip to 192.168.30.2 comment "WG_GUEST_51821_SNAT"
+}

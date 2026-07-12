@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+
+START=98
+STOP=11
+
+start() {
+  /usr/local/sbin/router-egress-slots-apply.sh start
+}
+
+stop() {
+  /usr/local/sbin/router-egress-slots-apply.sh stop
+}
+
+restart() {
+  stop
+  start
+}
+
+reload_service() {
+  start
+}

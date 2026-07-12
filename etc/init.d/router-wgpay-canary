@@ -1,0 +1,21 @@
+#!/bin/sh /etc/rc.common
+
+START=99
+STOP=10
+
+start() {
+  /usr/local/sbin/router-wgpay-canary-apply.sh start
+}
+
+stop() {
+  /usr/local/sbin/router-wgpay-canary-apply.sh stop
+}
+
+restart() {
+  stop
+  start
+}
+
+reload_service() {
+  start
+}
