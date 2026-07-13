@@ -12,6 +12,9 @@ if [ ! -f "$ENV_FILE" ]; then
   exit 1
 fi
 
+HMN_REQUEST_IFACE_CALLER_SET="${HMN_REQUEST_IFACE+x}"
+HMN_REQUEST_IFACE_CALLER_VALUE="${HMN_REQUEST_IFACE-}"
+
 . "$ENV_FILE"
 
 AWG_PARAM="${HMN_AWG_PARAM:-1}"
@@ -28,16 +31,45 @@ if ! command -v curl >/dev/null 2>&1; then
   exit 1
 fi
 
-if [ "${HMN_REQUEST_IFACE:-auto}" = "auto" ]; then
-  ACTIVE="$(ip route show table 200 | awk '/^default dev /{print $3; exit}')"
-else
-  ACTIVE="$HMN_REQUEST_IFACE"
+RUNTIME_LIB="/usr/local/lib/router-egress-vm101-runtime.sh"
+
+if [ ! -r "$RUNTIME_LIB" ]; then
+  echo "ERROR: нет читаемой runtime library: $RUNTIME_LIB"
+  exit 1
 fi
 
+. "$RUNTIME_LIB"
+
+if [ "$HMN_REQUEST_IFACE_CALLER_SET" = "x" ]; then
+  REQUEST_IFACE="$HMN_REQUEST_IFACE_CALLER_VALUE"
+else
+  REQUEST_IFACE="${HMN_REQUEST_IFACE:-auto}"
+fi
+
+case "$REQUEST_IFACE" in
+  auto)
+    ACTIVE="$(vm101_healthy_bootstrap_iface || true)"
+    ;;
+
+  vpn1|vpn2|vpn3|vpn4|vpn5)
+    if ! vm101_strict_iface "$REQUEST_IFACE" 1 0; then
+      echo "ERROR: requested VPN interface is invalid or unhealthy: $REQUEST_IFACE"
+      exit 1
+    fi
+
+    ACTIVE="$REQUEST_IFACE"
+    ;;
+
+  *)
+    echo "ERROR: requested VPN interface is invalid or unhealthy: $REQUEST_IFACE"
+    exit 1
+    ;;
+esac
+
 if [ -z "${ACTIVE:-}" ]; then
-  echo "ERROR: не нашёл active VPN interface."
-  echo "Проверь:"
-  echo "  ip route show table 200"
+  echo "ERROR: не найден ни один здоровый VPN interface vpn1-vpn5."
+  echo "Optional table 200 routes:"
+  ip route show table 200 2>/dev/null || true
   exit 1
 fi
 
