@@ -1,83 +1,163 @@
 #!/bin/sh
+# STEP_050M07R14B_LOCAL_REPAIR_NORMALIZATION
 set -u
 
+SLOTS_CONF="${SLOTS_CONF:-/etc/router-egress-slots.d/slots.conf}"
+
+[ -r "$SLOTS_CONF" ] || {
+    echo "BLOCK: slots_conf_missing:$SLOTS_CONF"
+    exit 2
+}
+
+slot_pref() {
+    case "$1" in
+        egress1) echo 10011 ;;
+        egress2) echo 10012 ;;
+        egress3) echo 10013 ;;
+        egress4) echo 10014 ;;
+        egress5) echo 10015 ;;
+        *) return 1 ;;
+    esac
+}
+
+slot_line() {
+    slot="$1"
+    grep -Ev '^[[:space:]]*(#|$)' "$SLOTS_CONF" | awk -v wanted="$slot" '$1 == wanted { print; exit }'
+}
+
 ensure_link() {
-  iface="$1"
-  ip link show "$iface" >/dev/null 2>&1 || {
-    echo "BLOCK: missing_iface_$iface"
-    exit 10
-  }
+    iface="$1"
+    ip link show "$iface" >/dev/null 2>&1 || {
+        echo "BLOCK: missing_iface_$iface"
+        return 10
+    }
 }
 
 ensure_rule() {
-  pref="$1"
-  mark="$2"
-  table="$3"
-
-  ip rule show | grep -E "fwmark $mark.*lookup $table|fwmark $mark/0xffffffff.*lookup $table" >/dev/null && return 0
-
-  ip rule add pref "$pref" fwmark "$mark" lookup "$table"
+    pref="$1"
+    mark="$2"
+    table="$3"
+    ip rule show | grep -E "fwmark $mark.*lookup $table|fwmark $mark/0xffffffff.*lookup $table" >/dev/null && return 0
+    ip rule add pref "$pref" fwmark "$mark" lookup "$table"
 }
 
-case "${1:-start}" in
-  start|restart|reload)
-    ensure_link vpn1
-    ensure_link vpn2
-    ensure_link vpn3
-    ensure_link vpn4
-    ensure_link vpn5
-
-    ip route replace default dev vpn1 table 201
-    ip route replace default dev vpn2 table 202
-    ip route replace default dev vpn3 table 203
-    ip route replace default dev vpn4 table 204
-    ip route replace default dev vpn5 table 205
-
-    ensure_rule 10011 0x201 201
-    ensure_rule 10012 0x202 202
-    ensure_rule 10013 0x203 203
-    ensure_rule 10014 0x204 204
-    ensure_rule 10015 0x205 205
-
-    ip route flush cache 2>/dev/null || true
-
-    ip route show table 200 | grep -F "default dev vpn1" >/dev/null || {
-      echo "BLOCK: legacy_table200_default_vpn1_missing"
-      exit 20
+apply_one() {
+    slot="$1"
+    line="$(slot_line "$slot")"
+    [ -n "$line" ] || {
+        echo "BLOCK: slot_not_found_$slot"
+        return 3
     }
 
+    set -- $line
+    slot_id="$1"
+    iface="$2"
+    table="$3"
+    mark="$4"
+    enabled="${11}"
+
+    [ "$enabled" = "1" ] || {
+        echo "SKIP: slot_disabled_$slot"
+        return 0
+    }
+
+    pref="$(slot_pref "$slot_id")" || {
+        echo "BLOCK: unsupported_slot_$slot_id"
+        return 4
+    }
+
+    ensure_link "$iface" || return $?
+    ip route replace default dev "$iface" table "$table" || return 11
+    ensure_rule "$pref" "$mark" "$table" || return 12
+
+    ip route show table "$table" | grep -Eq "default[[:space:]].*dev[[:space:]]+${iface}([[:space:]]|$)" || {
+        echo "BLOCK: table_${table}_default_${iface}_missing"
+        return 20
+    }
+    ip rule show | grep -E "fwmark $mark.*lookup $table|fwmark $mark/0xffffffff.*lookup $table" >/dev/null || {
+        echo "BLOCK: table_${table}_mark_${mark}_rule_missing"
+        return 21
+    }
+
+    echo "applied_slot=$slot_id iface=$iface table=$table mark=$mark"
+}
+
+stop_one() {
+    slot="$1"
+    line="$(slot_line "$slot")"
+    [ -n "$line" ] || return 0
+
+    set -- $line
+    slot_id="$1"
+    table="$3"
+    mark="$4"
+    pref="$(slot_pref "$slot_id")" || return 1
+
+    while ip rule show | grep -E "fwmark $mark.*lookup $table|fwmark $mark/0xffffffff.*lookup $table" >/dev/null; do
+        ip rule del fwmark "$mark" lookup "$table" 2>/dev/null \
+            || ip rule del pref "$pref" 2>/dev/null \
+            || break
+    done
+    ip route flush table "$table" 2>/dev/null || true
+    echo "stopped_slot=$slot_id table=$table mark=$mark"
+}
+
+all_slots() {
+    grep -Ev '^[[:space:]]*(#|$)' "$SLOTS_CONF" | awk '$11 == 1 { print $1 }'
+}
+
+apply_routes() {
+    requested="${1:-}"
+    if [ -n "$requested" ]; then
+        apply_one "$requested" || return $?
+    else
+        for slot in $(all_slots); do
+            apply_one "$slot" || return $?
+        done
+    fi
+    ip route flush cache 2>/dev/null || true
     echo "applied_router_egress_slots_5=1"
-    ;;
+    echo "legacy_table200_dependency=false"
+}
 
-  stop)
-    for mark_table in "0x201 201 10011" "0x202 202 10012" "0x203 203 10013" "0x204 204 10014" "0x205 205 10015"; do
-      set -- $mark_table
-      mark="$1"
-      table="$2"
-      pref="$3"
-      while ip rule show | grep -E "fwmark $mark.*lookup $table|fwmark $mark/0xffffffff.*lookup $table" >/dev/null; do
-        ip rule del fwmark "$mark" lookup "$table" 2>/dev/null || ip rule del pref "$pref" 2>/dev/null || break
-      done
-    done
-
-    ip route flush table 201 2>/dev/null || true
-    ip route flush table 202 2>/dev/null || true
-    ip route flush table 203 2>/dev/null || true
-    ip route flush table 204 2>/dev/null || true
-    ip route flush table 205 2>/dev/null || true
+stop_routes() {
+    requested="${1:-}"
+    if [ -n "$requested" ]; then
+        stop_one "$requested" || return $?
+    else
+        for slot in $(all_slots); do
+            stop_one "$slot" || return $?
+        done
+    fi
     echo "stopped_router_egress_slots_5=1"
-    ;;
+}
 
-  status)
-    ip rule show | grep -E 'fwmark 0x20[1-5]|lookup 20[1-5]' || true
-    for t in 201 202 203 204 205; do
-      echo "--- table $t ---"
-      ip route show table "$t" || true
-    done
-    ;;
+show_status() {
+    requested="${1:-}"
+    if [ -n "$requested" ]; then
+        line="$(slot_line "$requested")"
+        [ -n "$line" ] || return 3
+        set -- $line
+        echo "--- slot $1 iface $2 table $3 mark $4 ---"
+        ip rule show | grep -E "fwmark $4.*lookup $3|fwmark $4/0xffffffff.*lookup $3" || true
+        ip route show table "$3" || true
+    else
+        ip rule show | grep -E 'fwmark 0x20[1-5]|lookup 20[1-5]' || true
+        for table in 201 202 203 204 205; do
+            echo "--- table $table ---"
+            ip route show table "$table" || true
+        done
+    fi
+}
 
-  *)
-    echo "usage: $0 {start|stop|restart|reload|status}"
-    exit 1
-    ;;
+command="${1:-start}"
+requested="${2:-}"
+case "$command" in
+    start|restart|reload) apply_routes "$requested" ;;
+    stop) stop_routes "$requested" ;;
+    status) show_status "$requested" ;;
+    *)
+        echo "usage: $0 {start|stop|restart|reload|status} [egress1..egress5]"
+        exit 1
+        ;;
 esac
