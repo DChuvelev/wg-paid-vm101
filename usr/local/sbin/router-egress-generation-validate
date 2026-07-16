@@ -1,0 +1,66 @@
+#!/bin/sh
+set -u
+
+LIB="${ROUTER_EGRESS_GENERATION_LIB:-/usr/local/lib/router-egress-generation.sh}"
+[ -r "$LIB" ] || {
+    echo "RESULT=STOP_GENERATION_LIBRARY_MISSING"
+    echo "LIB=$LIB"
+    exit 2
+}
+# shellcheck disable=SC1090
+. "$LIB"
+
+generation_dir=""
+now_epoch=""
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --generation-dir)
+            shift
+            [ "$#" -gt 0 ] || { echo "RESULT=STOP_ARGUMENT_MISSING"; exit 2; }
+            generation_dir="$1"
+            ;;
+        --now-epoch)
+            shift
+            [ "$#" -gt 0 ] || { echo "RESULT=STOP_ARGUMENT_MISSING"; exit 2; }
+            now_epoch="$1"
+            ;;
+        --selftest)
+            gen_selftest
+            exit $?
+            ;;
+        --help|-h)
+            echo "Usage: router-egress-generation-validate --generation-dir DIR [--now-epoch EPOCH]"
+            echo "       router-egress-generation-validate --selftest"
+            exit 0
+            ;;
+        *)
+            echo "RESULT=STOP_UNKNOWN_ARGUMENT"
+            echo "ARGUMENT=$1"
+            exit 2
+            ;;
+    esac
+    shift
+done
+
+[ -n "$generation_dir" ] || {
+    echo "RESULT=STOP_GENERATION_DIR_REQUIRED"
+    exit 2
+}
+[ -n "$now_epoch" ] || now_epoch="$(date +%s)"
+
+if gen_validate_dir "$generation_dir" "$now_epoch"; then
+    echo "RESULT=PASS_STAGED_GENERATION_VALID"
+    echo "GENERATION_DIR=$generation_dir"
+    echo "GENERATION_ID=$GEN_LAST_DETAIL"
+    echo "SLOT_COUNT=5"
+    echo "ACTIVATION_ALLOWED=false"
+    echo "ACTIVE_SLOTS_CHANGED=false"
+    exit 0
+fi
+
+echo "RESULT=STOP_STAGED_GENERATION_INVALID"
+echo "REASON=$GEN_LAST_REASON"
+echo "DETAIL=$GEN_LAST_DETAIL"
+echo "GENERATION_DIR=$generation_dir"
+exit 1
