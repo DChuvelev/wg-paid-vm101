@@ -1,0 +1,192 @@
+#!/bin/sh
+set -eu
+umask 077
+
+GENERATION_CONF="${GENERATION_CONF:-/etc/router-egress-generation.conf}"
+VALIDATOR="${ROUTER_EGRESS_GENERATION_VALIDATOR:-/usr/local/sbin/router-egress-generation-validate}"
+STATE_HELPER="${ROUTER_EGRESS_RECOVERY_STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}"
+SOURCE_POOL="${ROUTER_EGRESS_SOURCE_POOL:-}"
+ACTIVE_OVERRIDE="${ROUTER_EGRESS_ACTIVE_SNAPSHOT_OVERRIDE:-}"
+QUARANTINE_OVERRIDE="${ROUTER_EGRESS_QUARANTINE_SNAPSHOT_OVERRIDE:-}"
+GENERATION_ID=""
+NOW_EPOCH=""
+
+usage() {
+    echo "Usage: router-egress-generation-build [--source-pool FILE] [--generation-id ID] [--now-epoch EPOCH]"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --source-pool) shift; [ "$#" -gt 0 ] || { echo RESULT=STOP_ARGUMENT_MISSING; exit 2; }; SOURCE_POOL="$1" ;;
+        --generation-id) shift; [ "$#" -gt 0 ] || { echo RESULT=STOP_ARGUMENT_MISSING; exit 2; }; GENERATION_ID="$1" ;;
+        --now-epoch) shift; [ "$#" -gt 0 ] || { echo RESULT=STOP_ARGUMENT_MISSING; exit 2; }; NOW_EPOCH="$1" ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo RESULT=STOP_UNKNOWN_ARGUMENT; echo "ARGUMENT=$1"; exit 2 ;;
+    esac
+    shift
+done
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || { echo RESULT=STOP_PREFLIGHT_REQUIRED_COMMAND_MISSING; echo "MISSING_COMMAND=$1"; exit 20; }
+}
+for c in sh awk sed grep find sha256sum install stat sort cp mv rm mkdir chmod date head tail wc tr basename dirname amneziawg uci; do require_command "$c"; done
+
+[ -r "$GENERATION_CONF" ] || { echo RESULT=STOP_GENERATION_CONFIG_MISSING; exit 21; }
+[ -x "$VALIDATOR" ] || { echo RESULT=STOP_GENERATION_VALIDATOR_MISSING; exit 21; }
+[ -r "$STATE_HELPER" ] || { echo RESULT=STOP_RECOVERY_STATE_HELPER_MISSING; exit 21; }
+# shellcheck disable=SC1090
+. "$GENERATION_CONF"
+# shellcheck disable=SC1090
+. "$STATE_HELPER"
+
+[ "${GENERATION_SCHEMA:-}" = "router-egress-generation-v1" ] || { echo RESULT=STOP_GENERATION_SCHEMA_MISMATCH; exit 22; }
+[ "${GENERATION_SLOT_COUNT:-}" = "5" ] || { echo RESULT=STOP_GENERATION_SLOT_COUNT_MISMATCH; exit 22; }
+[ "${GENERATION_ACTIVATION_ALLOWED:-}" = "false" ] || { echo RESULT=STOP_GENERATION_ACTIVATION_NOT_DISABLED; exit 22; }
+[ ! -e "$GENERATION_ACTIVE_LINK" ] || { echo RESULT=STOP_ACTIVE_GENERATION_ALREADY_PRESENT; exit 22; }
+
+is_uint() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
+endpoint_valid() {
+    awk -v ep="$1" 'BEGIN { n=split(ep,a,":"); if(n!=2 || a[2]!~/^[0-9]+$/ || a[2]<1 || a[2]>65535) exit 1; m=split(a[1],o,"."); if(m!=4) exit 1; for(i=1;i<=4;i++) if(o[i]!~/^[0-9]+$/ || o[i]<0 || o[i]>255) exit 1; exit 0 }'
+}
+config_endpoint() { sed -n 's/^[[:space:]]*Endpoint[[:space:]]*=[[:space:]]*//p' "$1" | head -n1 | tr -d '\r'; }
+active_endpoint() {
+    iface="$1"
+    ep="$(uci -q get "network.${iface}.hmn_endpoint" 2>/dev/null || true)"
+    if [ -z "$ep" ]; then ep="$(amneziawg show "$iface" endpoints 2>/dev/null | awk 'NF>=2 {print $NF; exit}')"; fi
+    printf '%s\n' "$ep"
+}
+
+if [ -z "$NOW_EPOCH" ]; then NOW_EPOCH="$(date +%s)"; fi
+is_uint "$NOW_EPOCH" || { echo RESULT=STOP_NOW_EPOCH_INVALID; exit 22; }
+if [ -z "$GENERATION_ID" ]; then GENERATION_ID="gen-$(date -u +%Y%m%d-%H%M%S)"; fi
+printf '%s\n' "$GENERATION_ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || { echo RESULT=STOP_GENERATION_ID_INVALID; exit 22; }
+[ "${#GENERATION_ID}" -le 64 ] || { echo RESULT=STOP_GENERATION_ID_TOO_LONG; exit 22; }
+
+if [ -z "$SOURCE_POOL" ]; then
+    for f in /root/hmn/cache/candidate-pool-awg1-latest.tsv /root/hmn/cache/ranked-awg1-latest.tsv; do
+        if [ -s "$f" ]; then SOURCE_POOL="$f"; break; fi
+    done
+fi
+[ -s "$SOURCE_POOL" ] || { echo RESULT=STOP_SOURCE_POOL_MISSING; echo "SOURCE_POOL=$SOURCE_POOL"; exit 23; }
+[ "$(head -n1 "$SOURCE_POOL")" = 'rank	avg_ms	file	endpoint	loss	config_path' ] || { echo RESULT=STOP_SOURCE_POOL_HEADER; exit 23; }
+POOL_MTIME="$(stat -c %Y "$SOURCE_POOL" 2>/dev/null || true)"
+is_uint "$POOL_MTIME" || { echo RESULT=STOP_SOURCE_POOL_MTIME_INVALID; exit 23; }
+POOL_AGE=$((NOW_EPOCH - POOL_MTIME))
+[ "$POOL_AGE" -ge 0 ] || { echo RESULT=STOP_SOURCE_POOL_FUTURE_MTIME; exit 23; }
+[ "$POOL_AGE" -le "$GENERATION_TEST_MAX_AGE_SEC" ] || { echo RESULT=STOP_SOURCE_POOL_STALE; echo "SOURCE_POOL_AGE_SEC=$POOL_AGE"; exit 23; }
+
+mkdir -p "$GENERATION_STATE_DIR" "$GENERATION_STAGING_DIR" "$GENERATION_REJECTED_DIR"
+chmod 700 "$GENERATION_STATE_DIR" "$GENERATION_STAGING_DIR" "$GENERATION_REJECTED_DIR"
+LOCK="$GENERATION_STATE_DIR/.builder.lock"
+if ! mkdir "$LOCK" 2>/dev/null; then echo RESULT=STOP_GENERATION_BUILDER_LOCK_BUSY; exit 24; fi
+TMP_PARENT="$GENERATION_STAGING_DIR/.tmp-${GENERATION_ID}-$$"
+WORK="$TMP_PARENT/$GENERATION_ID"
+FINAL="$GENERATION_STAGING_DIR/$GENERATION_ID"
+COMMITTED=false
+cleanup() {
+    rc=$?
+    trap - EXIT HUP INT TERM
+    if [ "$COMMITTED" != true ]; then rm -rf "$TMP_PARENT"; fi
+    rmdir "$LOCK" 2>/dev/null || true
+    exit "$rc"
+}
+trap cleanup EXIT HUP INT TERM
+[ ! -e "$FINAL" ] || { echo RESULT=STOP_GENERATION_ID_ALREADY_EXISTS; exit 24; }
+mkdir -p "$WORK/configs"
+chmod 700 "$TMP_PARENT" "$WORK" "$WORK/configs"
+
+if [ -n "$ACTIVE_OVERRIDE" ]; then
+    cp "$ACTIVE_OVERRIDE" "$WORK/active-endpoints.tsv"
+else
+    printf 'iface\tendpoint\n' > "$WORK/active-endpoints.tsv"
+    for iface in vpn1 vpn2 vpn3 vpn4 vpn5; do
+        ep="$(active_endpoint "$iface")"
+        endpoint_valid "$ep" || { echo RESULT=STOP_ACTIVE_ENDPOINT_INVALID; echo "IFACE=$iface"; echo "ENDPOINT=$ep"; exit 25; }
+        printf '%s\t%s\n' "$iface" "$ep" >> "$WORK/active-endpoints.tsv"
+    done
+fi
+[ "$(head -n1 "$WORK/active-endpoints.tsv")" = 'iface	endpoint' ] || { echo RESULT=STOP_ACTIVE_SNAPSHOT_HEADER; exit 25; }
+
+if [ -n "$QUARANTINE_OVERRIDE" ]; then
+    cp "$QUARANTINE_OVERRIDE" "$WORK/quarantine-snapshot.tsv"
+else
+    reg_init_state || { echo RESULT=STOP_RECOVERY_STATE_INIT_FAILED; exit 25; }
+    cp "$REG_QUARANTINE_TSV" "$WORK/quarantine-snapshot.tsv"
+fi
+[ "$(head -n1 "$WORK/quarantine-snapshot.tsv")" = 'ts_epoch	ts_utc	egress	iface	endpoint	replacement	reason	pool_path	pool_mtime_epoch	source_step' ] || { echo RESULT=STOP_QUARANTINE_SNAPSHOT_HEADER; exit 25; }
+cp "$SOURCE_POOL" "$WORK/source-pool.tsv"
+
+SELECTED="$TMP_PARENT/selected.tsv"
+SEEN_EP="$TMP_PARENT/seen-endpoints.txt"
+SEEN_RANK="$TMP_PARENT/seen-ranks.txt"
+: > "$SELECTED"; : > "$SEEN_EP"; : > "$SEEN_RANK"
+TAB="$(printf '\t')"
+count=0
+line=0
+while IFS="$TAB" read -r rank avg_ms file endpoint loss config_path extra; do
+    line=$((line + 1)); [ "$line" -eq 1 ] && continue
+    [ -z "$extra" ] || continue
+    is_uint "$rank" || continue
+    endpoint_valid "$endpoint" || continue
+    [ "$loss" = "0%" ] || continue
+    [ -f "$config_path" ] || continue
+    grep -Fqx "$endpoint" "$SEEN_EP" && continue
+    grep -Fqx "$rank" "$SEEN_RANK" && continue
+    awk -F '\t' -v ep="$endpoint" 'NR>1 && $2==ep {f=1} END{exit f?0:1}' "$WORK/active-endpoints.tsv" && continue
+    awk -F '\t' -v ep="$endpoint" 'NR>1 && $5==ep {f=1} END{exit f?0:1}' "$WORK/quarantine-snapshot.tsv" && continue
+    cfg_ep="$(config_endpoint "$config_path")"
+    [ "$cfg_ep" = "$endpoint" ] || continue
+    count=$((count + 1))
+    slot="egress$count"
+    install -m 0600 "$config_path" "$WORK/configs/${slot}.conf"
+    printf '%s\t%s\t%s\t%s\n' "$count" "$rank" "$endpoint" "$config_path" >> "$SELECTED"
+    printf '%s\n' "$endpoint" >> "$SEEN_EP"
+    printf '%s\n' "$rank" >> "$SEEN_RANK"
+    [ "$count" -ge 5 ] && break
+done < "$SOURCE_POOL"
+[ "$count" -eq 5 ] || { echo RESULT=STOP_INSUFFICIENT_ELIGIBLE_CANDIDATES; echo "ELIGIBLE_SELECTED=$count"; exit 26; }
+
+SOURCE_SHA="$(sha256sum "$WORK/source-pool.tsv" | awk '{print $1}')"
+cat > "$WORK/metadata.kv" <<EOF
+schema=$GENERATION_SCHEMA
+generation_id=$GENERATION_ID
+status=STAGED
+mode=SHADOW
+slot_count=5
+created_at_epoch=$NOW_EPOCH
+source_pool_sha256=$SOURCE_SHA
+activation_allowed=false
+EOF
+printf 'slot\tiface\ttable\tendpoint\tconfig_path\tconfig_sha256\ttested_at_epoch\ttest_result\tsource_rank\n' > "$WORK/candidates.tsv"
+while IFS="$TAB" read -r n rank endpoint original_path; do
+    slot="egress$n"; iface="vpn$n"; table=$((200+n)); cfg="configs/${slot}.conf"
+    cfg_sha="$(sha256sum "$WORK/$cfg" | awk '{print $1}')"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\tPASS\t%s\n' "$slot" "$iface" "$table" "$endpoint" "$cfg" "$cfg_sha" "$POOL_MTIME" "$rank" >> "$WORK/candidates.tsv"
+done < "$SELECTED"
+(
+    cd "$WORK"
+    sha256sum metadata.kv candidates.tsv source-pool.tsv active-endpoints.tsv quarantine-snapshot.tsv \
+        configs/egress1.conf configs/egress2.conf configs/egress3.conf configs/egress4.conf configs/egress5.conf > manifest.sha256
+)
+chmod 600 "$WORK"/*.tsv "$WORK"/*.kv "$WORK"/*.sha256 "$WORK/configs"/*.conf
+VALIDATOR_LOG="$TMP_PARENT/validator.log"
+if ! "$VALIDATOR" --generation-dir "$WORK" --now-epoch "$NOW_EPOCH" > "$VALIDATOR_LOG" 2>&1; then
+    cat "$VALIDATOR_LOG"
+    echo RESULT=STOP_GENERATION_VALIDATOR_FAILED
+    exit 27
+fi
+grep -qx 'RESULT=PASS_STAGED_GENERATION_VALID' "$VALIDATOR_LOG" || { cat "$VALIDATOR_LOG"; echo RESULT=STOP_GENERATION_VALIDATOR_PASS_MARKER_MISSING; exit 27; }
+rm -f "$VALIDATOR_LOG" "$SELECTED" "$SEEN_EP" "$SEEN_RANK"
+mv "$WORK" "$FINAL"
+COMMITTED=true
+rmdir "$TMP_PARENT" 2>/dev/null || true
+printf '%s\n' 'RESULT=PASS_R15B2_GENERATION_STAGED'
+printf 'GENERATION_ID=%s\n' "$GENERATION_ID"
+printf 'GENERATION_DIR=%s\n' "$FINAL"
+printf 'SOURCE_POOL=%s\n' "$SOURCE_POOL"
+printf 'SOURCE_POOL_AGE_SEC=%s\n' "$POOL_AGE"
+printf '%s\n' 'SLOT_COUNT=5'
+printf '%s\n' 'VALIDATOR=PASS'
+printf '%s\n' 'ACTIVATION_ALLOWED=false'
+printf '%s\n' 'ACTIVE_GENERATION_CREATED=false'
+printf '%s\n' 'ACTIVE_SLOTS_CHANGED=false'
