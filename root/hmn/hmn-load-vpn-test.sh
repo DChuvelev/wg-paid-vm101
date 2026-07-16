@@ -162,8 +162,6 @@ echo
 uci show network | grep -E '=amneziawg_vpn_test|@amneziawg_vpn_test.*public_key|@amneziawg_vpn_test.*allowed_ips|@amneziawg_vpn_test.*route_allowed_ips|@amneziawg_vpn_test.*endpoint_host|@amneziawg_vpn_test.*endpoint_port|@amneziawg_vpn_test.*persistent_keepalive'
 echo
 
-echo "Current table 200:"
-ip route show table 200
 echo
 
 if [ "$ACTION" = "up" ]; then
@@ -180,8 +178,6 @@ if [ "$ACTION" = "up" ]; then
   awg show vpn_test 2>/dev/null || wg show vpn_test 2>/dev/null || true
 
   echo
-  echo "Table 200 after ifup:"
-  ip route show table 200
 else
   echo "Не поднимал интерфейс."
   echo "Чтобы поднять:"

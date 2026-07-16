@@ -1,8 +1,3 @@
-# STEP_029C1_DISABLED * * * * * /usr/bin/vpn-egress-manager.sh >/dev/null 2>&1
-# STEP_029C1_DISABLED 20 4 * * * /root/hmn/hmn-refresh-pool-cron.sh
-# STEP_029C1_DISABLED 7,22,37,52 * * * * /root/hmn/hmn-pool-low-watermark-check.sh run >/dev/null 2>&1
-# STEP_029C1_DISABLED 5,35 * * * * /root/hmn/hmn-refresh-retry-cron.sh
-# STEP_029C1_DISABLED 10 3 * * * /root/hmn/hmn-clean-old-files.sh >/dev/null 2>&1
-# STEP_029C1_DISABLED * * * * * /root/hmn/hmn-vpn-user-override.sh tick >/dev/null 2>&1
-20 4 * * * /root/hmn/hmn-refresh-pool-safe.sh >>/root/hmn/logs/hmn-refresh-pool-cron.log 2>&1 # STEP_049C_HMN_REFRESH_DAILY_0420_POOL_ONLY_NO_MANAGER
-40 4 * * * /usr/local/sbin/router-egress-hmn-rebalance-top5-apply.sh --commit --confirm REBALANCE_TOP5_DAILY >>/var/log/router-egress-rebalance-top5.log 2>&1 # STEP_049F_DAILY_TOP5_REBALANCE_AFTER_HMN_REFRESH
+# VM101 egress automation is service-driven.
+# Legacy cron refresh/rebalance entry points were removed by STEP_050M07R15A.
+# FULL_POOL_REFRESH remains disabled until the generation-aware R15B/R16 implementation.

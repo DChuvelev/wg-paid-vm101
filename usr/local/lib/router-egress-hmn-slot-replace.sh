@@ -38,7 +38,7 @@ done
 SLOTS_CONF="${SLOTS_CONF:-/etc/router-egress-slots.d/slots.conf}"
 HMN_CACHE_DIR="${HMN_CACHE_DIR:-/root/hmn/cache}"
 MAX_POOL_AGE_SEC="${MAX_POOL_AGE_SEC:-129600}"
-PREFERRED_POOL_FILES="${PREFERRED_POOL_FILES:-ok-awg1-strict-foreign-latest.tsv ok-awg1-strict-all-latest.tsv working-awg1-latest.tsv selected-awg1-latest.tsv}"
+PREFERRED_POOL_FILES="${PREFERRED_POOL_FILES:-ok-awg1-strict-foreign-latest.tsv ok-awg1-strict-all-latest.tsv working-awg1-latest.tsv ranked-awg1-latest.tsv}"
 STATE_DIR="${STATE_DIR:-/var/lib/router-egress-recovery}"
 STATE_HELPER="${STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}"
 LOG="${LOG:-/var/log/router-egress-recovery-hmn.log}"
@@ -386,7 +386,7 @@ EOF
                 break
             fi
 
-            reg_quarantine_endpoint "$candidate" "$SLOT" "$iface" "" "repair_candidate_failed" "$selected_pool" "STEP_050M07R14B_LOCAL_REPAIR_NORMALIZATION" >/dev/null 2>&1 || true
+            reg_quarantine_endpoint "$candidate" "$SLOT" "$iface" "" "repair_candidate_failed" "$selected_pool" "STEP_050M07R15A_LEGACY_EXECUTION_FREEZE_AND_CLEAN_FOUNDATION" >/dev/null 2>&1 || true
         done <"$candidate_file"
 
         if [ "$decision" != "commit_ok" ]; then

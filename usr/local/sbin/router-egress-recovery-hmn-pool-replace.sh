@@ -1,5 +1,5 @@
 #!/bin/sh
-# STEP_050M07R14B_LOCAL_REPAIR_NORMALIZATION
+# STEP_050M07R15A_LEGACY_EXECUTION_FREEZE_AND_CLEAN_FOUNDATION
 set -u
 
 CONF="${ROUTER_EGRESS_RECOVERY_HMN_CONF:-/etc/router-egress-recovery-hmn.conf}"
@@ -7,8 +7,9 @@ CONF="${ROUTER_EGRESS_RECOVERY_HMN_CONF:-/etc/router-egress-recovery-hmn.conf}"
 
 ADAPTER_CORE_DEFAULT="/usr/local/lib/router-egress-hmn-slot-replace.sh"
 ADAPTER_CORE="${ROUTER_EGRESS_RECOVERY_CORE_OVERRIDE:-$ADAPTER_CORE_DEFAULT}"
-HELPER="${ROUTER_EGRESS_RECOVERY_STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}"
-LOG="${ROUTER_EGRESS_RECOVERY_STATE_LOG:-/var/log/router-egress-recovery-state.log}"
+HELPER="${ROUTER_EGRESS_RECOVERY_STATE_HELPER:-${STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}}"
+LOG="${ROUTER_EGRESS_RECOVERY_STATE_LOG:-${LOG:-/var/log/router-egress-recovery-state.log}}"
+FULL_REFRESH_AFTER_REPAIRS="${FULL_REFRESH_AFTER_REPAIRS:-5}"
 
 egress=""
 dry_run=false
@@ -69,12 +70,12 @@ fi
 if [ "$apply_requested" = "true" ] && [ "$dry_run" = "false" ]; then
     recovery_state_dir="${STATE_DIR:-/var/lib/router-egress-recovery}"
     mkdir -p "$recovery_state_dir/locks" 2>/dev/null || {
-        echo '{"schema":"router-egress-hmn-slot-replace-v3","decision":"refuse","reason":"local_repair_lock_dir_failed","apply_performed":false}'
+        echo '{"schema":"router-egress-hmn-slot-replace-v4","decision":"refuse","reason":"local_repair_lock_dir_failed","apply_performed":false}'
         exit 32
     }
     operation_lock="$recovery_state_dir/locks/local-repair.lock"
     if ! mkdir "$operation_lock" 2>/dev/null; then
-        echo '{"schema":"router-egress-hmn-slot-replace-v3","decision":"refuse","reason":"local_repair_lock_busy","apply_performed":false}'
+        echo '{"schema":"router-egress-hmn-slot-replace-v4","decision":"refuse","reason":"local_repair_lock_busy","apply_performed":false}'
         exit 32
     fi
     operation_lock_owned=true
@@ -95,7 +96,7 @@ rollback_file="$(sed -n 's/.*"rollback_file": "\([^"]*\)".*/\1/p' "$out" 2>/dev/
 
 record_ok=false
 global_count=""
-daily_count=""
+full_refresh_due=false
 state_failure=false
 state_restore_ok=false
 network_rollback_ok=false
@@ -123,34 +124,30 @@ if [ "$rc" -eq 0 ] \
             cp -p "$REG_STATE_KV" "$state_txn_dir/state.kv.before" 2>/dev/null || : >"$state_txn_dir/state.kv.before"
 
             global_file="$(reg_counter_file "$REG_REPAIR_EVENTS_KEY")"
-            daily_key="$(reg_daily_repair_key)"
-            daily_file="$(reg_counter_file "$daily_key")"
             if [ -e "$global_file" ]; then
                 cp -p "$global_file" "$state_txn_dir/global.before"
                 echo 1 >"$state_txn_dir/global.existed"
             else
                 echo 0 >"$state_txn_dir/global.existed"
             fi
-            if [ -e "$daily_file" ]; then
-                cp -p "$daily_file" "$state_txn_dir/daily.before"
-                echo 1 >"$state_txn_dir/daily.existed"
-            else
-                echo 0 >"$state_txn_dir/daily.existed"
-            fi
 
-            if reg_quarantine_endpoint "$old_ep" "$egress" "$iface" "$new_ep" "repair_replaced_endpoint" "$pool_path" "STEP_050M07R14B_LOCAL_REPAIR_NORMALIZATION" >/dev/null 2>&1; then
+            if reg_quarantine_endpoint "$old_ep" "$egress" "$iface" "$new_ep" "repair_replaced_endpoint" "$pool_path" "STEP_050M07R15A_LEGACY_EXECUTION_FREEZE_AND_CLEAN_FOUNDATION" >/dev/null 2>&1; then
                 global_count="$(reg_repair_events_inc 2>/dev/null || true)"
-                daily_count="$(reg_daily_repair_inc 2>/dev/null || true)"
+                case "$global_count:$FULL_REFRESH_AFTER_REPAIRS" in
+                    *[!0-9:]*) full_refresh_due=false ;;
+                    *) [ "$global_count" -ge "$FULL_REFRESH_AFTER_REPAIRS" ] && full_refresh_due=true || full_refresh_due=false ;;
+                esac
 
-                if [ -n "$global_count" ] && [ -n "$daily_count" ]; then
+                if [ -n "$global_count" ]; then
                     now="$(reg_now_epoch 2>/dev/null || date +%s)"
-                    if reg_set_state last_repair_epoch "$now" >/dev/null 2>&1 \
+                    if reg_set_state mode LOCAL_REPAIR_READY >/dev/null 2>&1 \
+                        && reg_set_state last_repair_epoch "$now" >/dev/null 2>&1 \
                         && reg_set_state last_repair_egress "$egress" >/dev/null 2>&1 \
                         && reg_set_state last_repair_iface "$iface" >/dev/null 2>&1 \
                         && reg_set_state last_repair_old_endpoint "$old_ep" >/dev/null 2>&1 \
                         && reg_set_state last_repair_new_endpoint "$new_ep" >/dev/null 2>&1 \
                         && reg_set_state repair_events_since_full_refresh "$global_count" >/dev/null 2>&1 \
-                        && reg_set_state daily_repair_count "$daily_count" >/dev/null 2>&1; then
+                        && reg_set_state full_refresh_due "$full_refresh_due" >/dev/null 2>&1; then
                         record_ok=true
                     fi
                 fi
@@ -168,11 +165,6 @@ if [ "$rc" -eq 0 ] \
                 else
                     rm -f "$global_file" 2>/dev/null || restore_failed=true
                 fi
-                if [ "$(cat "$state_txn_dir/daily.existed")" = "1" ]; then
-                    cp -p "$state_txn_dir/daily.before" "$daily_file" 2>/dev/null || restore_failed=true
-                else
-                    rm -f "$daily_file" 2>/dev/null || restore_failed=true
-                fi
                 [ "$restore_failed" = "false" ] && state_restore_ok=true
             fi
 
@@ -184,9 +176,9 @@ if [ "$rc" -eq 0 ] \
     fi
 
     mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
-    printf '%s action=record_successful_repair egress=%s iface=%s old=%s new=%s pool=%s repair_events=%s daily_count=%s record_ok=%s state_restore_ok=%s\n' \
+    printf '%s action=record_successful_repair egress=%s iface=%s old=%s new=%s pool=%s repair_events=%s full_refresh_due=%s record_ok=%s state_restore_ok=%s\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)" \
-        "$egress" "$iface" "$old_ep" "$new_ep" "$pool_path" "$global_count" "$daily_count" "$record_ok" "$state_restore_ok" >>"$LOG" 2>/dev/null || true
+        "$egress" "$iface" "$old_ep" "$new_ep" "$pool_path" "$global_count" "$full_refresh_due" "$record_ok" "$state_restore_ok" >>"$LOG" 2>/dev/null || true
 
     if [ "$record_ok" != "true" ]; then
         state_failure=true
@@ -199,7 +191,7 @@ fi
 
 if [ "$state_failure" = "true" ]; then
     cat "$err" >&2 2>/dev/null || true
-    printf '{"schema":"router-egress-hmn-slot-replace-v3","slot":"%s","interface":"%s","current_endpoint":"%s","candidate_endpoint":"%s","pool_path":"%s","decision":"commit_failed","reason":"state_record_failed_after_network_success","apply_performed":true,"rollback_performed":true,"network_rollback_ok":%s,"state_restore_ok":%s}\n' \
+    printf '{"schema":"router-egress-hmn-slot-replace-v4","slot":"%s","interface":"%s","current_endpoint":"%s","candidate_endpoint":"%s","pool_path":"%s","decision":"commit_failed","reason":"state_record_failed_after_network_success","apply_performed":true,"rollback_performed":true,"network_rollback_ok":%s,"state_restore_ok":%s}\n' \
         "$egress" "$iface" "$old_ep" "$new_ep" "$pool_path" "$network_rollback_ok" "$state_restore_ok"
     echo "state_record_failed_after_success=true network_rollback_ok=$network_rollback_ok state_restore_ok=$state_restore_ok" >&2
     exit 31

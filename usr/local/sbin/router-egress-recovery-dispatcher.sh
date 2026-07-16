@@ -1,5 +1,5 @@
 #!/bin/sh
-# STEP_050M07R14B_LOCAL_REPAIR_NORMALIZATION
+# STEP_050M07R15A_LEGACY_EXECUTION_FREEZE_AND_CLEAN_FOUNDATION
 set -u
 
 ADAPTER="${ADAPTER:-/usr/local/sbin/router-egress-recovery-hmn-pool-replace.sh}"

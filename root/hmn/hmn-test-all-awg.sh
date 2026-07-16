@@ -235,8 +235,6 @@ echo
 echo "Strict rejects with ping loss:"
 awk -F '\t' '$1=="FAIL_PING_LOSS"{print $2 " | " $3 " | loss=" $6 " | avg=" $7}' "$RESULTS"
 echo
-echo "table 200:"
-ip route show table 200
 echo
 echo "main routes touching vpn_test:"
 ip route show | grep vpn_test || true

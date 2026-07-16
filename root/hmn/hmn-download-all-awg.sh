@@ -68,8 +68,6 @@ esac
 
 if [ -z "${ACTIVE:-}" ]; then
   echo "ERROR: не найден ни один здоровый VPN interface vpn1-vpn5."
-  echo "Optional table 200 routes:"
-  ip route show table 200 2>/dev/null || true
   exit 1
 fi
 
@@ -280,17 +278,6 @@ cp "$FAIL_FILE" "$BASE/cache/fail-awg${AWG_PARAM}-latest.tsv"
 cp "$CANDIDATES_FILE" "$BASE/cache/wg-candidates-latest.tsv"
 chmod 600 "$BASE/cache/"*.tsv 2>/dev/null || true
 
-# Successful new config batch => reset temporary quarantine for this AWG batch.
-# If the download fails before this point, old latest/quarantine stay untouched.
-QUARANTINE_LATEST="$BASE/cache/quarantine-awg${AWG_PARAM}-latest.tsv"
-if [ -f "$QUARANTINE_LATEST" ]; then
-  cp "$QUARANTINE_LATEST" "$RUN_DIR/quarantine-before-reset-awg${AWG_PARAM}.tsv" 2>/dev/null || true
-  chmod 600 "$RUN_DIR/quarantine-before-reset-awg${AWG_PARAM}.tsv" 2>/dev/null || true
-fi
-{
-  printf "endpoint\tfile\treason\tadded_at\n"
-} > "$QUARANTINE_LATEST"
-chmod 600 "$QUARANTINE_LATEST"
 
 {
   echo "HideMyName AWG download summary"

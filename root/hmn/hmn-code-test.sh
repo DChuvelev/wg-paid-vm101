@@ -58,8 +58,6 @@ esac
 
 if [ -z "${ACTIVE:-}" ]; then
   echo "ERROR: не найден ни один здоровый VPN interface vpn1-vpn5."
-  echo "Optional table 200 routes:"
-  ip route show table 200 2>/dev/null || true
   exit 1
 fi
 
