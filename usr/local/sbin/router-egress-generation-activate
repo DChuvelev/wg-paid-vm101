@@ -1,0 +1,507 @@
+#!/bin/sh
+set -eu
+umask 077
+
+GENERATION_CONF="${GENERATION_CONF:-/etc/router-egress-generation.conf}"
+VALIDATOR="${ROUTER_EGRESS_GENERATION_VALIDATOR:-/usr/local/sbin/router-egress-generation-validate}"
+STATE_HELPER="${ROUTER_EGRESS_RECOVERY_STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}"
+NETWORK_CONFIG="${ROUTER_EGRESS_NETWORK_CONFIG:-/etc/config/network}"
+SLOTS_CONF="${ROUTER_EGRESS_SLOTS_CONF:-/etc/router-egress-slots.d/slots.conf}"
+SLOTS_APPLY="${ROUTER_EGRESS_SLOTS_APPLY:-/usr/local/sbin/router-egress-slots-apply.sh}"
+HEALTH_SERVICE="${ROUTER_EGRESS_HEALTH_SERVICE:-/etc/init.d/router-egress-health-repair}"
+UCI_BIN="${UCI_BIN:-uci}"
+IFUP_BIN="${IFUP_BIN:-ifup}"
+IFDOWN_BIN="${IFDOWN_BIN:-ifdown}"
+IP_BIN="${IP_BIN:-ip}"
+PING_BIN="${PING_BIN:-ping}"
+AWG_BIN="${AWG_BIN:-amneziawg}"
+SLEEP_BIN="${SLEEP_BIN:-sleep}"
+POST_UP_SLEEP_SEC="${POST_UP_SLEEP_SEC:-8}"
+STATE_DIR="${ROUTER_EGRESS_ACTIVATION_STATE_DIR:-/var/lib/router-egress-recovery/activations}"
+AUTHORIZATION_DIR="${ROUTER_EGRESS_ACTIVATION_AUTH_DIR:-/var/lib/router-egress-recovery/activation-authorizations}"
+AUTHORIZATION_FILE=""
+AUTHORIZATION_MAX_FUTURE_SEC="${ROUTER_EGRESS_AUTHORIZATION_MAX_FUTURE_SEC:-60}"
+HANDSHAKE_MAX_AGE_SEC="${ROUTER_EGRESS_HANDSHAKE_MAX_AGE_SEC:-300}"
+BUILD_NETWORK_HOOK="${ROUTER_EGRESS_BUILD_NETWORK_HOOK:-}"
+APPLY_NETWORK_HOOK="${ROUTER_EGRESS_APPLY_NETWORK_HOOK:-}"
+HEALTH_CHECK_HOOK="${ROUTER_EGRESS_HEALTH_CHECK_HOOK:-}"
+GEN_DIR=""
+CONFIRM=""
+NOW_EPOCH=""
+
+usage() {
+    echo "Usage: router-egress-generation-activate --generation-dir DIR --authorization-file FILE --confirm ACTIVATE_<ID> [--now-epoch EPOCH]"
+}
+
+while [ "$#" -gt 0 ]; do
+    case "$1" in
+        --generation-dir) shift; [ "$#" -gt 0 ] || { echo RESULT=STOP_ARGUMENT_MISSING; exit 2; }; GEN_DIR="$1" ;;
+        --authorization-file) shift; [ "$#" -gt 0 ] || { echo RESULT=STOP_ARGUMENT_MISSING; exit 2; }; AUTHORIZATION_FILE="$1" ;;
+        --confirm) shift; [ "$#" -gt 0 ] || { echo RESULT=STOP_ARGUMENT_MISSING; exit 2; }; CONFIRM="$1" ;;
+        --now-epoch) shift; [ "$#" -gt 0 ] || { echo RESULT=STOP_ARGUMENT_MISSING; exit 2; }; NOW_EPOCH="$1" ;;
+        --help|-h) usage; exit 0 ;;
+        *) echo RESULT=STOP_UNKNOWN_ARGUMENT; echo "ARGUMENT=$1"; exit 2 ;;
+    esac
+    shift
+done
+
+require_command() {
+    command -v "$1" >/dev/null 2>&1 || { echo RESULT=STOP_PREFLIGHT_REQUIRED_COMMAND_MISSING; echo "MISSING_COMMAND=$1"; exit 20; }
+}
+for c in sh awk sed grep cut tr head tail wc sort find sha256sum install cp mv rm mkdir rmdir chmod date readlink ln cmp stat; do require_command "$c"; done
+[ -n "$BUILD_NETWORK_HOOK" ] || require_command "$UCI_BIN"
+[ -n "$APPLY_NETWORK_HOOK" ] || { require_command "$IFUP_BIN"; require_command "$IFDOWN_BIN"; require_command "$IP_BIN"; require_command "$AWG_BIN"; require_command "$PING_BIN"; require_command "$SLEEP_BIN"; }
+
+[ -r "$GENERATION_CONF" ] || { echo RESULT=STOP_GENERATION_CONFIG_MISSING; exit 21; }
+[ -x "$VALIDATOR" ] || { echo RESULT=STOP_GENERATION_VALIDATOR_MISSING; exit 21; }
+[ -r "$STATE_HELPER" ] || { echo RESULT=STOP_RECOVERY_STATE_HELPER_MISSING; exit 21; }
+[ -r "$NETWORK_CONFIG" ] || { echo RESULT=STOP_NETWORK_CONFIG_MISSING; exit 21; }
+[ -r "$SLOTS_CONF" ] || { echo RESULT=STOP_SLOTS_CONFIG_MISSING; exit 21; }
+[ -x "$SLOTS_APPLY" ] || { echo RESULT=STOP_SLOTS_APPLY_MISSING; exit 21; }
+# shellcheck disable=SC1090
+. "$GENERATION_CONF"
+# shellcheck disable=SC1090
+. "$STATE_HELPER"
+[ "${GENERATION_SCHEMA:-}" = router-egress-generation-v1 ] || { echo RESULT=STOP_GENERATION_SCHEMA_MISMATCH; exit 22; }
+[ "${GENERATION_SLOT_COUNT:-}" = 5 ] || { echo RESULT=STOP_GENERATION_SLOT_COUNT_MISMATCH; exit 22; }
+[ "${GENERATION_ACTIVATION_ALLOWED:-false}" = false ] || { echo RESULT=STOP_R16_AUTOMATIC_ACTIVATION_MUST_REMAIN_DISABLED; exit 22; }
+[ -n "$GEN_DIR" ] && [ -d "$GEN_DIR" ] || { echo RESULT=STOP_GENERATION_DIR_REQUIRED; exit 22; }
+GEN_ID="$(basename "$GEN_DIR")"
+[ "$CONFIRM" = "ACTIVATE_${GEN_ID}" ] || { echo RESULT=STOP_ACTIVATION_CONFIRMATION_MISMATCH; echo "EXPECTED_CONFIRM=ACTIVATE_${GEN_ID}"; exit 22; }
+case "$GEN_DIR" in "$GENERATION_STAGING_DIR"/*) ;; *) echo RESULT=STOP_GENERATION_NOT_IN_STAGING; exit 22 ;; esac
+[ -n "$AUTHORIZATION_FILE" ] && [ -f "$AUTHORIZATION_FILE" ] && [ ! -L "$AUTHORIZATION_FILE" ] || { echo RESULT=STOP_R16_AUTHORIZATION_FILE_REQUIRED; exit 22; }
+case "$AUTHORIZATION_FILE" in "$AUTHORIZATION_DIR"/*) ;; *) echo RESULT=STOP_R16_AUTHORIZATION_PATH_INVALID; exit 22 ;; esac
+[ "$(stat -c %a "$AUTHORIZATION_FILE" 2>/dev/null || true)" = 600 ] || { echo RESULT=STOP_R16_AUTHORIZATION_MODE_INVALID; exit 22; }
+[ -z "$NOW_EPOCH" ] && NOW_EPOCH="$(date +%s)"
+case "$NOW_EPOCH" in ''|*[!0-9]*) echo RESULT=STOP_NOW_EPOCH_INVALID; exit 22 ;; esac
+case "$AUTHORIZATION_MAX_FUTURE_SEC" in ''|*[!0-9]*) echo RESULT=STOP_R16_AUTHORIZATION_TOLERANCE_INVALID; exit 22 ;; esac
+case "$HANDSHAKE_MAX_AGE_SEC" in ''|*[!0-9]*) echo RESULT=STOP_R16_HANDSHAKE_MAX_AGE_INVALID; exit 22 ;; esac
+
+auth_get() { key="$1"; sed -n "s/^${key}=//p" "$AUTHORIZATION_FILE" | tail -n1; }
+AUTH_SCHEMA="$(auth_get schema)"
+AUTH_ID="$(auth_get authorization_id)"
+AUTH_GEN_ID="$(auth_get generation_id)"
+AUTH_GEN_DIR="$(auth_get generation_dir)"
+AUTH_MANIFEST_SHA="$(auth_get generation_manifest_sha256)"
+AUTH_ISSUED="$(auth_get issued_at_epoch)"
+AUTH_EXPIRES="$(auth_get expires_at_epoch)"
+AUTH_SINGLE_USE="$(auth_get single_use)"
+AUTH_SOURCE_STEP="$(auth_get source_step)"
+[ "$AUTH_SCHEMA" = router-egress-activation-authorization-v1 ] || { echo RESULT=STOP_R16_AUTHORIZATION_SCHEMA; exit 22; }
+printf '%s\n' "$AUTH_ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || { echo RESULT=STOP_R16_AUTHORIZATION_ID; exit 22; }
+[ "$AUTH_GEN_ID" = "$GEN_ID" ] || { echo RESULT=STOP_R16_AUTHORIZATION_GENERATION_ID; exit 22; }
+[ "$AUTH_GEN_DIR" = "$GEN_DIR" ] || { echo RESULT=STOP_R16_AUTHORIZATION_GENERATION_DIR; exit 22; }
+[ "$AUTH_MANIFEST_SHA" = "$(sha256sum "$GEN_DIR/manifest.sha256" | awk '{print $1}')" ] || { echo RESULT=STOP_R16_AUTHORIZATION_MANIFEST_SHA; exit 22; }
+case "$AUTH_ISSUED" in ''|*[!0-9]*) echo RESULT=STOP_R16_AUTHORIZATION_ISSUED; exit 22 ;; esac
+case "$AUTH_EXPIRES" in ''|*[!0-9]*) echo RESULT=STOP_R16_AUTHORIZATION_EXPIRES; exit 22 ;; esac
+[ "$AUTH_ISSUED" -le $((NOW_EPOCH + AUTHORIZATION_MAX_FUTURE_SEC)) ] || { echo RESULT=STOP_R16_AUTHORIZATION_FROM_FUTURE; exit 22; }
+[ "$NOW_EPOCH" -le "$AUTH_EXPIRES" ] || { echo RESULT=STOP_R16_AUTHORIZATION_EXPIRED; exit 22; }
+[ "$AUTH_EXPIRES" -gt "$AUTH_ISSUED" ] || { echo RESULT=STOP_R16_AUTHORIZATION_WINDOW_INVALID; exit 22; }
+[ "$AUTH_SINGLE_USE" = true ] || { echo RESULT=STOP_R16_AUTHORIZATION_NOT_SINGLE_USE; exit 22; }
+[ "$AUTH_SOURCE_STEP" = STEP_050M07R16_TRANSACTIONAL_GENERATION_ACTIVATION_R01 ] || { echo RESULT=STOP_R16_AUTHORIZATION_SOURCE_STEP; exit 22; }
+
+VALIDATOR_LOG="/tmp/router-egress-r16-validator.$$.log"
+if ! "$VALIDATOR" --generation-dir "$GEN_DIR" --now-epoch "$NOW_EPOCH" >"$VALIDATOR_LOG" 2>&1; then
+    cat "$VALIDATOR_LOG"; rm -f "$VALIDATOR_LOG"
+    echo RESULT=STOP_R16_STAGED_GENERATION_INVALID
+    exit 23
+fi
+grep -qx RESULT=PASS_STAGED_GENERATION_VALID "$VALIDATOR_LOG" || { cat "$VALIDATOR_LOG"; rm -f "$VALIDATOR_LOG"; echo RESULT=STOP_R16_VALIDATOR_MARKER_MISSING; exit 23; }
+rm -f "$VALIDATOR_LOG"
+
+if [ -e "$GENERATION_ACTIVE_LINK" ] || [ -L "$GENERATION_ACTIVE_LINK" ]; then
+    active_real="$(readlink -f "$GENERATION_ACTIVE_LINK" 2>/dev/null || true)"
+    [ "$active_real" = "$(readlink -f "$GEN_DIR")" ] && { echo RESULT=STOP_R16_GENERATION_ALREADY_ACTIVE; exit 24; }
+    echo RESULT=STOP_R16_OTHER_ACTIVE_GENERATION_PRESENT
+    echo "ACTIVE_GENERATION=$active_real"
+    exit 24
+fi
+
+reg_init_state || { echo RESULT=STOP_R16_STATE_INIT_FAILED; exit 24; }
+mkdir -p "$STATE_DIR" "$REG_LOCK_DIR" "$AUTHORIZATION_DIR"
+chmod 700 "$STATE_DIR" "$REG_LOCK_DIR" "$AUTHORIZATION_DIR"
+GLOBAL_LOCK="$REG_LOCK_DIR/generation-activation.lock"
+REPAIR_LOCK="$REG_LOCK_DIR/local-repair.lock"
+mkdir "$GLOBAL_LOCK" 2>/dev/null || { echo RESULT=STOP_R16_ACTIVATION_LOCK_BUSY; exit 24; }
+REPAIR_LOCK_OWNED=false
+if mkdir "$REPAIR_LOCK" 2>/dev/null; then REPAIR_LOCK_OWNED=true; else rmdir "$GLOBAL_LOCK" 2>/dev/null || true; echo RESULT=STOP_R16_LOCAL_REPAIR_LOCK_BUSY; exit 24; fi
+
+TXN_ID="$(date -u +%Y%m%d-%H%M%S)-${GEN_ID}"
+TXN_DIR="$STATE_DIR/$TXN_ID"
+mkdir -p "$TXN_DIR/backup" "$TXN_DIR/uci"
+chmod 700 "$TXN_DIR" "$TXN_DIR/backup" "$TXN_DIR/uci"
+CONSUMED_AUTH="$TXN_DIR/authorization.consumed.kv"
+mv "$AUTHORIZATION_FILE" "$CONSUMED_AUTH"
+chmod 600 "$CONSUMED_AUTH"
+AUTHORIZATION_FILE="$CONSUMED_AUTH"
+early_exit() {
+    rc=$?
+    trap - EXIT HUP INT TERM
+    rmdir "$REPAIR_LOCK" 2>/dev/null || true
+    rmdir "$GLOBAL_LOCK" 2>/dev/null || true
+    if [ "$rc" -ne 0 ]; then
+        echo "TRANSACTION_DIR=$TXN_DIR"
+        echo "ROLLBACK_OK=true"
+    fi
+    exit "$rc"
+}
+trap early_exit EXIT HUP INT TERM
+RUN_LOG="$TXN_DIR/run.log"
+ROLLBACK_LOG="$TXN_DIR/rollback.log"
+BASELINE="$TXN_DIR/baseline-endpoints.tsv"
+EXPECTED="$TXN_DIR/expected-endpoints.tsv"
+cp -p "$NETWORK_CONFIG" "$TXN_DIR/backup/network"
+cp -p "$REG_STATE_KV" "$TXN_DIR/backup/state.kv" 2>/dev/null || : > "$TXN_DIR/backup/state.kv"
+COUNTER_FILE="$(reg_counter_file "$REG_REPAIR_EVENTS_KEY")"
+if [ -e "$COUNTER_FILE" ]; then cp -p "$COUNTER_FILE" "$TXN_DIR/backup/repair-counter"; echo true > "$TXN_DIR/backup/repair-counter.existed"; else : > "$TXN_DIR/backup/repair-counter"; echo false > "$TXN_DIR/backup/repair-counter.existed"; fi
+printf 'iface\tendpoint\n' > "$BASELINE"
+printf 'iface\tendpoint\n' > "$EXPECTED"
+
+runtime_endpoint() {
+    iface="$1"
+    "$AWG_BIN" show "$iface" dump 2>/dev/null | sed -n '2p' | cut -f3
+}
+runtime_handshake_epoch() {
+    iface="$1"
+    "$AWG_BIN" show "$iface" dump 2>/dev/null | sed -n '2p' | cut -f5
+}
+handshake_recent() {
+    iface="$1"
+    hs="$(runtime_handshake_epoch "$iface" 2>/dev/null || true)"
+    case "$hs" in ''|*[!0-9]*) return 1 ;; esac
+    [ "$hs" -gt 0 ] || return 1
+    current_epoch="$(date +%s)"
+    age=$((current_epoch - hs))
+    [ "$age" -ge 0 ] && [ "$age" -le "$HANDSHAKE_MAX_AGE_SEC" ]
+}
+config_value() {
+    key="$1" file="$2"
+    awk -v key="$key" '$0 ~ "^[[:space:]]*" key "[[:space:]]*=" { sub(/^[^=]*=[[:space:]]*/, "", $0); sub(/[[:space:]]*$/, "", $0); print; exit }' "$file"
+}
+trim() { printf '%s' "$1" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' ; }
+slot_health_fields() {
+    iface="$1"
+    grep -Ev '^[[:space:]]*(#|$)' "$SLOTS_CONF" | awk -v iface="$iface" '$2==iface {print $8 "\t" $9 "\t" $10; exit}'
+}
+strict_iface() {
+    iface="$1"
+    fields="$(slot_health_fields "$iface")"
+    targets="$(printf '%s' "$fields" | cut -f1)"
+    count="$(printf '%s' "$fields" | cut -f2)"
+    timeout="$(printf '%s' "$fields" | cut -f3)"
+    case "$count" in ''|*[!0-9]*) count=3 ;; esac
+    case "$timeout" in ''|*[!0-9]*) timeout=2 ;; esac
+    oldifs="$IFS"; IFS=','
+    for target in $targets; do
+        IFS="$oldifs"; target="$(trim "$target")"; [ -n "$target" ] || continue
+        "$PING_BIN" -I "$iface" -c "$count" -W "$timeout" "$target" >/dev/null 2>&1 || return 1
+        IFS=','
+    done
+    IFS="$oldifs"
+    return 0
+}
+verify_routes() {
+    n=1
+    while [ "$n" -le 5 ]; do
+        iface="vpn$n"; table=$((200+n)); mark="0x20$n"
+        "$IP_BIN" route show table "$table" 2>/dev/null | grep -Eq "^default[[:space:]].*dev[[:space:]]+${iface}([[:space:]]|$)" || return 1
+        "$IP_BIN" rule show 2>/dev/null | grep -E "fwmark ${mark}.*lookup ${table}|fwmark ${mark}/0xffffffff.*lookup ${table}" >/dev/null || return 1
+        n=$((n+1))
+    done
+}
+service_was_running=false
+if [ -x "$HEALTH_SERVICE" ] && "$HEALTH_SERVICE" running >/dev/null 2>&1; then service_was_running=true; fi
+
+n=1
+while [ "$n" -le 5 ]; do
+    iface="vpn$n"; ep="$(runtime_endpoint "$iface" 2>/dev/null || true)"
+    [ -n "$ep" ] || { echo RESULT=STOP_R16_BASELINE_ENDPOINT_MISSING; echo "IFACE=$iface"; exit 25; }
+    printf '%s\t%s\n' "$iface" "$ep" >> "$BASELINE"
+    cfg="$GEN_DIR/configs/egress$n.conf"; expected_ep="$(config_value Endpoint "$cfg")"
+    [ -n "$expected_ep" ] || { echo RESULT=STOP_R16_EXPECTED_ENDPOINT_MISSING; echo "CONFIG=$cfg"; exit 25; }
+    printf '%s\t%s\n' "$iface" "$expected_ep" >> "$EXPECTED"
+    n=$((n+1))
+done
+
+COMMITTED=false
+RUNTIME_MUTATED=false
+ROLLBACK_OK=false
+cleanup_locks() {
+    [ "$REPAIR_LOCK_OWNED" = true ] && rmdir "$REPAIR_LOCK" 2>/dev/null || true
+    rmdir "$GLOBAL_LOCK" 2>/dev/null || true
+}
+restore_state() {
+    cp -p "$TXN_DIR/backup/state.kv" "${REG_STATE_KV}.r16-restore.$$" && mv "${REG_STATE_KV}.r16-restore.$$" "$REG_STATE_KV"
+    if [ "$(cat "$TXN_DIR/backup/repair-counter.existed")" = true ]; then
+        cp -p "$TXN_DIR/backup/repair-counter" "${COUNTER_FILE}.r16-restore.$$" && mv "${COUNTER_FILE}.r16-restore.$$" "$COUNTER_FILE"
+    else
+        rm -f "$COUNTER_FILE"
+    fi
+}
+apply_runtime_default() {
+    source_network="$1"
+    install -m 0600 "$source_network" "${NETWORK_CONFIG}.r16-new.$$"
+    mv "${NETWORK_CONFIG}.r16-new.$$" "$NETWORK_CONFIG"
+    n=1
+    while [ "$n" -le 5 ]; do
+        iface="vpn$n"
+        "$IFDOWN_BIN" "$iface" >/dev/null 2>&1 || true
+        "$IFUP_BIN" "$iface" >/dev/null 2>&1 || return 1
+        "$SLEEP_BIN" "$POST_UP_SLEEP_SEC"
+        n=$((n+1))
+    done
+    "$SLOTS_APPLY" start >/dev/null 2>&1
+}
+rollback_runtime() {
+    set +e
+    : > "$ROLLBACK_LOG"
+    rm -f "${GENERATION_ACTIVE_LINK}.r16-new.$$"
+    [ ! -e "$GENERATION_ACTIVE_LINK" ] || rm -f "$GENERATION_ACTIVE_LINK"
+    if [ -n "$APPLY_NETWORK_HOOK" ]; then
+        "$APPLY_NETWORK_HOOK" rollback "$TXN_DIR/backup/network" "$TXN_DIR" >>"$ROLLBACK_LOG" 2>&1
+        rr=$?
+    else
+        apply_runtime_default "$TXN_DIR/backup/network" >>"$ROLLBACK_LOG" 2>&1
+        rr=$?
+    fi
+    health_ok=true
+    if [ "$rr" -eq 0 ]; then
+        n=1
+        while [ "$n" -le 5 ]; do
+            iface="vpn$n"; want="$(awk -F '\t' -v x="$iface" '$1==x{print $2}' "$BASELINE")"
+            got="$(runtime_endpoint "$iface" 2>/dev/null || true)"
+            [ "$got" = "$want" ] || health_ok=false
+            if [ -n "$HEALTH_CHECK_HOOK" ]; then
+                "$HEALTH_CHECK_HOOK" "$iface" "$want" "$TXN_DIR" || health_ok=false
+            else
+                strict_iface "$iface" || health_ok=false
+            fi
+            handshake_recent "$iface" || health_ok=false
+            n=$((n+1))
+        done
+        verify_routes || health_ok=false
+    else
+        health_ok=false
+    fi
+    if [ "$health_ok" = true ]; then
+        restore_state >>"$ROLLBACK_LOG" 2>&1 || health_ok=false
+    else
+        echo 'STATE_ROLLBACK_SKIPPED=runtime_not_proven_restored' >>"$ROLLBACK_LOG"
+    fi
+    if [ "$service_was_running" = true ]; then
+        [ -x "$HEALTH_SERVICE" ] || health_ok=false
+        "$HEALTH_SERVICE" start >>"$ROLLBACK_LOG" 2>&1 || health_ok=false
+        "$SLEEP_BIN" 1
+        "$HEALTH_SERVICE" running >>"$ROLLBACK_LOG" 2>&1 || health_ok=false
+    fi
+    [ "$health_ok" = true ] && ROLLBACK_OK=true || ROLLBACK_OK=false
+    printf 'ROLLBACK_OK=%s\n' "$ROLLBACK_OK" >> "$ROLLBACK_LOG"
+    set -e
+}
+on_exit() {
+    rc=$?
+    trap - EXIT HUP INT TERM
+    if [ "$rc" -ne 0 ] && [ "$COMMITTED" != true ]; then
+        if [ "$RUNTIME_MUTATED" = true ]; then rollback_runtime; else ROLLBACK_OK=true; fi
+    fi
+    cleanup_locks
+    if [ "$rc" -ne 0 ]; then
+        exec >&3 2>&4
+        cat "$RUN_LOG"
+        echo "TRANSACTION_DIR=$TXN_DIR"
+        echo "ROLLBACK_OK=$ROLLBACK_OK"
+    fi
+    exit "$rc"
+}
+trap on_exit EXIT HUP INT TERM
+
+exec 3>&1 4>&2
+exec >"$RUN_LOG" 2>&1
+printf '>>> prepare complete five-slot network configuration\n'
+cp -p "$NETWORK_CONFIG" "$TXN_DIR/uci/network"
+if [ -n "$BUILD_NETWORK_HOOK" ]; then
+    "$BUILD_NETWORK_HOOK" "$GEN_DIR" "$TXN_DIR/uci/network" "$TXN_DIR"
+else
+    n=1
+    while [ "$n" -le 5 ]; do
+        iface="vpn$n"; cfg="$GEN_DIR/configs/egress$n.conf"
+        private_key="$(config_value PrivateKey "$cfg")"; address="$(config_value Address "$cfg")"; dns="$(config_value DNS "$cfg")"
+        jc="$(config_value Jc "$cfg")"; jmin="$(config_value Jmin "$cfg")"; jmax="$(config_value Jmax "$cfg")"
+        s1="$(config_value S1 "$cfg")"; s2="$(config_value S2 "$cfg")"
+        h1="$(config_value H1 "$cfg")"; h2="$(config_value H2 "$cfg")"; h3="$(config_value H3 "$cfg")"; h4="$(config_value H4 "$cfg")"
+        public_key="$(config_value PublicKey "$cfg")"; allowed_ips="$(config_value AllowedIPs "$cfg")"
+        endpoint="$(config_value Endpoint "$cfg")"; keepalive="$(config_value PersistentKeepalive "$cfg")"
+        [ -n "$private_key" ] && [ -n "$address" ] && [ -n "$public_key" ] && [ -n "$endpoint" ] || { echo RESULT=STOP_R16_CONFIG_PARSE_FAILED; echo "CONFIG=$cfg"; exit 26; }
+        endpoint_host="${endpoint%:*}"; endpoint_port="${endpoint##*:}"
+        auto="$($UCI_BIN -c "$TXN_DIR/uci" -q get network.${iface}.auto 2>/dev/null || echo 1)"
+        disabled="$($UCI_BIN -c "$TXN_DIR/uci" -q get network.${iface}.disabled 2>/dev/null || echo 0)"
+        while :; do
+            sec="$($UCI_BIN -c "$TXN_DIR/uci" -q show network | sed -n "s/^\(network\.@amneziawg_${iface}\[[0-9][0-9]*\]\)=amneziawg_${iface}$/\1/p" | head -n1)"
+            [ -n "$sec" ] || break
+            $UCI_BIN -c "$TXN_DIR/uci" -q delete "$sec"
+        done
+        if ! $UCI_BIN -c "$TXN_DIR/uci" -q get "network.${iface}" >/dev/null 2>&1; then
+            $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}=interface"
+        fi
+        $UCI_BIN -c "$TXN_DIR/uci" -q delete "network.${iface}.addresses" 2>/dev/null || true
+        $UCI_BIN -c "$TXN_DIR/uci" -q delete "network.${iface}.dns" 2>/dev/null || true
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.proto=amneziawg"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.private_key=${private_key}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.awg_jc=${jc}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.awg_jmin=${jmin}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.awg_jmax=${jmax}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.awg_s1=${s1}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.awg_s2=${s2}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.awg_h1=${h1}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.awg_h2=${h2}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.awg_h3=${h3}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.awg_h4=${h4}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.auto=${auto}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.disabled=${disabled}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.delegate=0"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.peerdns=0"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.defaultroute=0"
+        oldifs="$IFS"; IFS=','
+        for value in $address; do IFS="$oldifs"; value="$(trim "$value")"; [ -n "$value" ] && $UCI_BIN -c "$TXN_DIR/uci" add_list "network.${iface}.addresses=${value}"; IFS=','; done
+        for value in $dns; do IFS="$oldifs"; value="$(trim "$value")"; [ -n "$value" ] && $UCI_BIN -c "$TXN_DIR/uci" add_list "network.${iface}.dns=${value}"; IFS=','; done
+        IFS="$oldifs"
+        peer="$($UCI_BIN -c "$TXN_DIR/uci" add network "amneziawg_${iface}")"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${peer}.description=r16-${GEN_ID}-egress${n}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${peer}.public_key=${public_key}"
+        oldifs="$IFS"; IFS=','
+        for value in ${allowed_ips:-0.0.0.0/0}; do IFS="$oldifs"; value="$(trim "$value")"; [ -n "$value" ] && $UCI_BIN -c "$TXN_DIR/uci" add_list "network.${peer}.allowed_ips=${value}"; IFS=','; done
+        IFS="$oldifs"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${peer}.route_allowed_ips=0"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${peer}.persistent_keepalive=${keepalive:-25}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${peer}.endpoint_host=${endpoint_host}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${peer}.endpoint_port=${endpoint_port}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.hmn_role=production_slot"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.hmn_source_config=${cfg}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.hmn_generation_id=${GEN_ID}"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.hmn_loaded_at=$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        $UCI_BIN -c "$TXN_DIR/uci" set "network.${iface}.hmn_endpoint=${endpoint}"
+        n=$((n+1))
+    done
+    $UCI_BIN -c "$TXN_DIR/uci" commit network
+fi
+[ -s "$TXN_DIR/uci/network" ] || { echo RESULT=STOP_R16_PREPARED_NETWORK_EMPTY; exit 26; }
+
+printf '>>> stop health repair service and apply complete prepared network\n'
+RUNTIME_MUTATED=true
+[ "$service_was_running" = true ] && "$HEALTH_SERVICE" stop >/dev/null 2>&1 || true
+if [ -n "$APPLY_NETWORK_HOOK" ]; then
+    "$APPLY_NETWORK_HOOK" apply "$TXN_DIR/uci/network" "$TXN_DIR"
+else
+    apply_runtime_default "$TXN_DIR/uci/network"
+fi
+
+printf '>>> verify all five endpoints and strict health\n'
+n=1
+while [ "$n" -le 5 ]; do
+    iface="vpn$n"; want="$(awk -F '\t' -v x="$iface" '$1==x{print $2}' "$EXPECTED")"
+    got="$(runtime_endpoint "$iface" 2>/dev/null || true)"
+    [ "$got" = "$want" ] || { echo RESULT=STOP_R16_RUNTIME_ENDPOINT_MISMATCH; echo "IFACE=$iface"; echo "EXPECTED=$want"; echo "ACTUAL=$got"; exit 27; }
+    if [ -n "$HEALTH_CHECK_HOOK" ]; then "$HEALTH_CHECK_HOOK" "$iface" "$want" "$TXN_DIR"; else strict_iface "$iface"; fi || { echo RESULT=STOP_R16_STRICT_HEALTH_FAILED; echo "IFACE=$iface"; exit 27; }
+    handshake_recent "$iface" || { echo RESULT=STOP_R16_HANDSHAKE_NOT_RECENT; echo "IFACE=$iface"; exit 27; }
+    n=$((n+1))
+done
+verify_routes || { echo RESULT=STOP_R16_ROUTE_OR_RULE_VERIFY_FAILED; exit 27; }
+
+printf '>>> commit active symlink and reset repair state only after complete proof\n'
+ln -s "$GEN_DIR" "${GENERATION_ACTIVE_LINK}.r16-new.$$"
+mv "${GENERATION_ACTIVE_LINK}.r16-new.$$" "$GENERATION_ACTIVE_LINK"
+reg_repair_events_reset || { echo RESULT=STOP_R16_REPAIR_COUNTER_RESET_FAILED; exit 28; }
+reg_set_state mode NORMAL || { echo RESULT=STOP_R16_STATE_MODE_FAILED; exit 28; }
+reg_set_state active_generation_id "$GEN_ID" || { echo RESULT=STOP_R16_STATE_GENERATION_FAILED; exit 28; }
+reg_set_state active_generation_dir "$GEN_DIR" || { echo RESULT=STOP_R16_STATE_GENERATION_DIR_FAILED; exit 28; }
+reg_set_state last_full_refresh_epoch "$NOW_EPOCH" || { echo RESULT=STOP_R16_STATE_REFRESH_EPOCH_FAILED; exit 28; }
+reg_set_state full_refresh_due false || { echo RESULT=STOP_R16_STATE_REFRESH_DUE_FAILED; exit 28; }
+[ "$(reg_repair_events_get)" = 0 ] || { echo RESULT=STOP_R16_REPAIR_COUNTER_NOT_ZERO; exit 28; }
+[ "$(readlink -f "$GENERATION_ACTIVE_LINK")" = "$(readlink -f "$GEN_DIR")" ] || { echo RESULT=STOP_R16_ACTIVE_LINK_VERIFY_FAILED; exit 28; }
+
+cat > "$TXN_DIR/activation.kv" <<ACT
+result=PASS_R16_GENERATION_ACTIVATED
+generation_id=$GEN_ID
+generation_dir=$GEN_DIR
+active_link=$GENERATION_ACTIVE_LINK
+repair_events_since_full_refresh=0
+authorization_id=$AUTH_ID
+authorization_consumed=true
+service_was_running=$service_was_running
+runtime_impact=true
+ACT
+cat > "$TXN_DIR/rollback.sh" <<ROLLBACK
+#!/bin/sh
+set -eu
+TXN_DIR='$TXN_DIR'
+NETWORK_CONFIG='$NETWORK_CONFIG'
+GENERATION_ACTIVE_LINK='$GENERATION_ACTIVE_LINK'
+STATE_HELPER='$STATE_HELPER'
+SLOTS_CONF='$SLOTS_CONF'
+SLOTS_APPLY='$SLOTS_APPLY'
+HEALTH_SERVICE='$HEALTH_SERVICE'
+IFDOWN_BIN='$IFDOWN_BIN'
+IFUP_BIN='$IFUP_BIN'
+IP_BIN='$IP_BIN'
+PING_BIN='$PING_BIN'
+AWG_BIN='$AWG_BIN'
+SLEEP_BIN='$SLEEP_BIN'
+# shellcheck disable=SC1090
+. "\$STATE_HELPER"
+reg_init_state
+GLOBAL_LOCK="\$REG_LOCK_DIR/generation-activation.lock"
+REPAIR_LOCK="\$REG_LOCK_DIR/local-repair.lock"
+mkdir "\$GLOBAL_LOCK" 2>/dev/null || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_ACTIVATION_LOCK_BUSY; exit 2; }
+repair_owned=false
+cleanup(){ [ "\$repair_owned" = true ] && rmdir "\$REPAIR_LOCK" 2>/dev/null || true; rmdir "\$GLOBAL_LOCK" 2>/dev/null || true; }
+trap cleanup EXIT HUP INT TERM
+mkdir "\$REPAIR_LOCK" 2>/dev/null || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_REPAIR_LOCK_BUSY; exit 2; }
+repair_owned=true
+"\$HEALTH_SERVICE" stop >/dev/null 2>&1 || true
+cp -p "\$TXN_DIR/backup/network" "\${NETWORK_CONFIG}.manual-rollback.tmp"; mv "\${NETWORK_CONFIG}.manual-rollback.tmp" "\$NETWORK_CONFIG"
+rm -f "\$GENERATION_ACTIVE_LINK"
+for iface in vpn1 vpn2 vpn3 vpn4 vpn5; do "\$IFDOWN_BIN" "\$iface" >/dev/null 2>&1 || true; "\$IFUP_BIN" "\$iface" >/dev/null 2>&1 || exit 2; "\$SLEEP_BIN" 3; done
+"\$SLOTS_APPLY" start >/dev/null 2>&1
+for n in 1 2 3 4 5; do
+  iface="vpn\$n"; table=\$((200+n)); mark="0x20\$n"
+  want="\$(awk -F '\t' -v x="\$iface" '\$1==x{print \$2}' "\$TXN_DIR/baseline-endpoints.tsv")"
+  got="\$("\$AWG_BIN" show "\$iface" dump 2>/dev/null | sed -n '2p' | cut -f3)"
+  [ "\$got" = "\$want" ] || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_ENDPOINT; echo "IFACE=\$iface"; exit 3; }
+  "\$IP_BIN" route show table "\$table" | grep -Eq "^default[[:space:]].*dev[[:space:]]+\${iface}([[:space:]]|\$)" || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_ROUTE; echo "TABLE=\$table"; exit 3; }
+  "\$IP_BIN" rule show | grep -E "fwmark \${mark}.*lookup \${table}|fwmark \${mark}/0xffffffff.*lookup \${table}" >/dev/null || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_RULE; echo "TABLE=\$table"; exit 3; }
+  line="\$(grep -Ev '^[[:space:]]*(#|\$)' "\$SLOTS_CONF" | awk -v x="\$iface" '\$2==x{print;exit}')"
+  set -- \$line; targets="\$8"; count="\$9"; shift 9; timeout="\$1"
+  oldifs="\$IFS"; IFS=','
+  for target in \$targets; do IFS="\$oldifs"; target="\$(printf '%s' "\$target"|sed 's/^[[:space:]]*//;s/[[:space:]]*\$//')"; [ -n "\$target" ] || continue; "\$PING_BIN" -I "\$iface" -c "\$count" -W "\$timeout" "\$target" >/dev/null 2>&1 || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_STRICT_HEALTH; echo "IFACE=\$iface"; exit 3; }; IFS=','; done
+  IFS="\$oldifs"
+done
+cp -p "\$TXN_DIR/backup/state.kv" "\${REG_STATE_KV}.manual-rollback.tmp"; mv "\${REG_STATE_KV}.manual-rollback.tmp" "\$REG_STATE_KV"
+COUNTER_FILE="\$(reg_counter_file "\$REG_REPAIR_EVENTS_KEY")"
+if [ "\$(cat "\$TXN_DIR/backup/repair-counter.existed")" = true ]; then cp -p "\$TXN_DIR/backup/repair-counter" "\${COUNTER_FILE}.manual-rollback.tmp"; mv "\${COUNTER_FILE}.manual-rollback.tmp" "\$COUNTER_FILE"; else rm -f "\$COUNTER_FILE"; fi
+if [ '$service_was_running' = true ]; then
+  "\$HEALTH_SERVICE" start >/dev/null 2>&1
+  "\$SLEEP_BIN" 1
+  "\$HEALTH_SERVICE" running >/dev/null 2>&1
+fi
+echo RESULT=PASS_R16_MANUAL_RUNTIME_ROLLBACK
+ROLLBACK
+chmod 700 "$TXN_DIR/rollback.sh"
+if [ "$service_was_running" = true ]; then
+    "$HEALTH_SERVICE" start >/dev/null 2>&1 || { echo RESULT=STOP_R16_HEALTH_SERVICE_RESTART_FAILED; exit 28; }
+    "$SLEEP_BIN" 1
+    "$HEALTH_SERVICE" running >/dev/null 2>&1 || { echo RESULT=STOP_R16_HEALTH_SERVICE_NOT_RUNNING_AFTER_RESTART; exit 28; }
+fi
+COMMITTED=true
+printf 'RESULT=PASS_R16_GENERATION_ACTIVATED\n'
+printf 'GENERATION_ID=%s\n' "$GEN_ID"
+printf 'GENERATION_DIR=%s\n' "$GEN_DIR"
+printf 'ACTIVE_LINK=%s\n' "$GENERATION_ACTIVE_LINK"
+printf 'TRANSACTION_DIR=%s\n' "$TXN_DIR"
+printf 'ROLLBACK_FILE=%s\n' "$TXN_DIR/rollback.sh"
+printf 'REPAIR_COUNTER_RESET=true\n'
+printf 'AUTHORIZATION_ID=%s\n' "$AUTH_ID"
+printf 'AUTHORIZATION_CONSUMED=true\n'
+printf 'ACTIVE_SLOT_COUNT=5\n'
+printf 'RUNTIME_IMPACT=true\n'
+exec >&3
+cat "$RUN_LOG"

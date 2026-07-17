@@ -29,7 +29,7 @@ done
 require_command() {
     command -v "$1" >/dev/null 2>&1 || { echo RESULT=STOP_PREFLIGHT_REQUIRED_COMMAND_MISSING; echo "MISSING_COMMAND=$1"; exit 20; }
 }
-for c in sh awk sed grep find sha256sum install stat sort cp mv rm mkdir chmod date head tail wc tr basename dirname amneziawg uci; do require_command "$c"; done
+for c in sh awk sed grep find sha256sum install stat sort cp mv rm mkdir chmod date head tail wc tr basename dirname amneziawg uci readlink; do require_command "$c"; done
 
 [ -r "$GENERATION_CONF" ] || { echo RESULT=STOP_GENERATION_CONFIG_MISSING; exit 21; }
 [ -x "$VALIDATOR" ] || { echo RESULT=STOP_GENERATION_VALIDATOR_MISSING; exit 21; }
@@ -42,7 +42,11 @@ for c in sh awk sed grep find sha256sum install stat sort cp mv rm mkdir chmod d
 [ "${GENERATION_SCHEMA:-}" = "router-egress-generation-v1" ] || { echo RESULT=STOP_GENERATION_SCHEMA_MISMATCH; exit 22; }
 [ "${GENERATION_SLOT_COUNT:-}" = "5" ] || { echo RESULT=STOP_GENERATION_SLOT_COUNT_MISMATCH; exit 22; }
 [ "${GENERATION_ACTIVATION_ALLOWED:-}" = "false" ] || { echo RESULT=STOP_GENERATION_ACTIVATION_NOT_DISABLED; exit 22; }
-[ ! -e "$GENERATION_ACTIVE_LINK" ] || { echo RESULT=STOP_ACTIVE_GENERATION_ALREADY_PRESENT; exit 22; }
+if [ -e "$GENERATION_ACTIVE_LINK" ]; then
+    active_real="$(readlink -f "$GENERATION_ACTIVE_LINK" 2>/dev/null || true)"
+    [ -n "$active_real" ] && [ -d "$active_real" ] || { echo RESULT=STOP_ACTIVE_GENERATION_LINK_INVALID; exit 22; }
+    case "$active_real" in "$GENERATION_STAGING_DIR"/*) ;; *) echo RESULT=STOP_ACTIVE_GENERATION_PATH_INVALID; echo "ACTIVE_GENERATION=$active_real"; exit 22 ;; esac
+fi
 
 is_uint() { case "$1" in ''|*[!0-9]*) return 1;; *) return 0;; esac; }
 endpoint_valid() {
