@@ -22,6 +22,8 @@ AUTHORIZATION_DIR="${ROUTER_EGRESS_ACTIVATION_AUTH_DIR:-/var/lib/router-egress-r
 AUTHORIZATION_FILE=""
 AUTHORIZATION_MAX_FUTURE_SEC="${ROUTER_EGRESS_AUTHORIZATION_MAX_FUTURE_SEC:-60}"
 HANDSHAKE_MAX_AGE_SEC="${ROUTER_EGRESS_HANDSHAKE_MAX_AGE_SEC:-300}"
+LOCAL_REPAIR_LOCK_HELD="${ROUTER_EGRESS_LOCAL_REPAIR_LOCK_HELD:-0}"
+HEALTH_SERVICE_MANAGED_BY_CALLER="${ROUTER_EGRESS_HEALTH_SERVICE_MANAGED_BY_CALLER:-0}"
 BUILD_NETWORK_HOOK="${ROUTER_EGRESS_BUILD_NETWORK_HOOK:-}"
 APPLY_NETWORK_HOOK="${ROUTER_EGRESS_APPLY_NETWORK_HOOK:-}"
 HEALTH_CHECK_HOOK="${ROUTER_EGRESS_HEALTH_CHECK_HOOK:-}"
@@ -87,10 +89,30 @@ AUTH_ISSUED="$(auth_get issued_at_epoch)"
 AUTH_EXPIRES="$(auth_get expires_at_epoch)"
 AUTH_SINGLE_USE="$(auth_get single_use)"
 AUTH_SOURCE_STEP="$(auth_get source_step)"
-[ "$AUTH_SCHEMA" = router-egress-activation-authorization-v1 ] || { echo RESULT=STOP_R16_AUTHORIZATION_SCHEMA; exit 22; }
+AUTH_OPERATION="$(auth_get operation)"
+AUTH_PREVIOUS_GEN_ID="$(auth_get previous_generation_id)"
+AUTH_PREVIOUS_GEN_DIR="$(auth_get previous_generation_dir)"
+AUTH_TRIGGER_COUNTER="$(auth_get trigger_counter)"
+OPERATION=initial_activation
+case "$AUTH_SCHEMA" in
+    router-egress-activation-authorization-v1)
+        [ "$AUTH_SOURCE_STEP" = STEP_050M07R16_TRANSACTIONAL_GENERATION_ACTIVATION_R01 ] || { echo RESULT=STOP_R16_AUTHORIZATION_SOURCE_STEP; exit 22; }
+        ;;
+    router-egress-activation-authorization-v2)
+        OPERATION=replace_active_generation
+        [ "$AUTH_OPERATION" = replace_active_generation ] || { echo RESULT=STOP_R18_AUTHORIZATION_OPERATION; exit 22; }
+        [ "$AUTH_SOURCE_STEP" = STEP_050M07R18_FULL_POOL_REFRESH_TRIGGER_AND_TRANSACTIONAL_REPLACEMENT_R01 ] || { echo RESULT=STOP_R18_AUTHORIZATION_SOURCE_STEP; exit 22; }
+        case "$AUTH_TRIGGER_COUNTER" in ''|*[!0-9]*) echo RESULT=STOP_R18_AUTHORIZATION_TRIGGER_COUNTER; exit 22 ;; esac
+        ;;
+    *) echo RESULT=STOP_R16_AUTHORIZATION_SCHEMA; exit 22 ;;
+esac
 printf '%s\n' "$AUTH_ID" | grep -Eq '^[A-Za-z0-9][A-Za-z0-9._-]*$' || { echo RESULT=STOP_R16_AUTHORIZATION_ID; exit 22; }
 [ "$AUTH_GEN_ID" = "$GEN_ID" ] || { echo RESULT=STOP_R16_AUTHORIZATION_GENERATION_ID; exit 22; }
-[ "$AUTH_GEN_DIR" = "$GEN_DIR" ] || { echo RESULT=STOP_R16_AUTHORIZATION_GENERATION_DIR; exit 22; }
+if [ "$OPERATION" = initial_activation ]; then
+    [ "$AUTH_GEN_DIR" = "$GEN_DIR" ] || { echo RESULT=STOP_R16_AUTHORIZATION_GENERATION_DIR; exit 22; }
+else
+    [ "$(readlink -f "$AUTH_GEN_DIR" 2>/dev/null || true)" = "$(readlink -f "$GEN_DIR")" ] || { echo RESULT=STOP_R18_AUTHORIZATION_GENERATION_DIR; exit 22; }
+fi
 [ "$AUTH_MANIFEST_SHA" = "$(sha256sum "$GEN_DIR/manifest.sha256" | awk '{print $1}')" ] || { echo RESULT=STOP_R16_AUTHORIZATION_MANIFEST_SHA; exit 22; }
 case "$AUTH_ISSUED" in ''|*[!0-9]*) echo RESULT=STOP_R16_AUTHORIZATION_ISSUED; exit 22 ;; esac
 case "$AUTH_EXPIRES" in ''|*[!0-9]*) echo RESULT=STOP_R16_AUTHORIZATION_EXPIRES; exit 22 ;; esac
@@ -98,7 +120,6 @@ case "$AUTH_EXPIRES" in ''|*[!0-9]*) echo RESULT=STOP_R16_AUTHORIZATION_EXPIRES;
 [ "$NOW_EPOCH" -le "$AUTH_EXPIRES" ] || { echo RESULT=STOP_R16_AUTHORIZATION_EXPIRED; exit 22; }
 [ "$AUTH_EXPIRES" -gt "$AUTH_ISSUED" ] || { echo RESULT=STOP_R16_AUTHORIZATION_WINDOW_INVALID; exit 22; }
 [ "$AUTH_SINGLE_USE" = true ] || { echo RESULT=STOP_R16_AUTHORIZATION_NOT_SINGLE_USE; exit 22; }
-[ "$AUTH_SOURCE_STEP" = STEP_050M07R16_TRANSACTIONAL_GENERATION_ACTIVATION_R01 ] || { echo RESULT=STOP_R16_AUTHORIZATION_SOURCE_STEP; exit 22; }
 
 VALIDATOR_LOG="/tmp/router-egress-r16-validator.$$.log"
 if ! "$VALIDATOR" --generation-dir "$GEN_DIR" --now-epoch "$NOW_EPOCH" >"$VALIDATOR_LOG" 2>&1; then
@@ -109,12 +130,21 @@ fi
 grep -qx RESULT=PASS_STAGED_GENERATION_VALID "$VALIDATOR_LOG" || { cat "$VALIDATOR_LOG"; rm -f "$VALIDATOR_LOG"; echo RESULT=STOP_R16_VALIDATOR_MARKER_MISSING; exit 23; }
 rm -f "$VALIDATOR_LOG"
 
+PREVIOUS_ACTIVE_EXISTS=false
+PREVIOUS_ACTIVE_TARGET=""
+PREVIOUS_ACTIVE_REAL=""
 if [ -e "$GENERATION_ACTIVE_LINK" ] || [ -L "$GENERATION_ACTIVE_LINK" ]; then
-    active_real="$(readlink -f "$GENERATION_ACTIVE_LINK" 2>/dev/null || true)"
-    [ "$active_real" = "$(readlink -f "$GEN_DIR")" ] && { echo RESULT=STOP_R16_GENERATION_ALREADY_ACTIVE; exit 24; }
-    echo RESULT=STOP_R16_OTHER_ACTIVE_GENERATION_PRESENT
-    echo "ACTIVE_GENERATION=$active_real"
-    exit 24
+    PREVIOUS_ACTIVE_EXISTS=true
+    PREVIOUS_ACTIVE_TARGET="$(readlink "$GENERATION_ACTIVE_LINK" 2>/dev/null || true)"
+    PREVIOUS_ACTIVE_REAL="$(readlink -f "$GENERATION_ACTIVE_LINK" 2>/dev/null || true)"
+    [ "$PREVIOUS_ACTIVE_REAL" = "$(readlink -f "$GEN_DIR")" ] && { echo RESULT=STOP_R16_GENERATION_ALREADY_ACTIVE; exit 24; }
+fi
+if [ "$OPERATION" = initial_activation ]; then
+    [ "$PREVIOUS_ACTIVE_EXISTS" = false ] || { echo RESULT=STOP_R16_OTHER_ACTIVE_GENERATION_PRESENT; echo "ACTIVE_GENERATION=$PREVIOUS_ACTIVE_REAL"; exit 24; }
+else
+    [ "$PREVIOUS_ACTIVE_EXISTS" = true ] || { echo RESULT=STOP_R18_PREVIOUS_ACTIVE_GENERATION_MISSING; exit 24; }
+    [ "$(basename "$PREVIOUS_ACTIVE_REAL")" = "$AUTH_PREVIOUS_GEN_ID" ] || { echo RESULT=STOP_R18_PREVIOUS_GENERATION_ID_MISMATCH; exit 24; }
+    [ "$(readlink -f "$AUTH_PREVIOUS_GEN_DIR" 2>/dev/null || true)" = "$PREVIOUS_ACTIVE_REAL" ] || { echo RESULT=STOP_R18_PREVIOUS_GENERATION_DIR_MISMATCH; exit 24; }
 fi
 
 reg_init_state || { echo RESULT=STOP_R16_STATE_INIT_FAILED; exit 24; }
@@ -124,7 +154,11 @@ GLOBAL_LOCK="$REG_LOCK_DIR/generation-activation.lock"
 REPAIR_LOCK="$REG_LOCK_DIR/local-repair.lock"
 mkdir "$GLOBAL_LOCK" 2>/dev/null || { echo RESULT=STOP_R16_ACTIVATION_LOCK_BUSY; exit 24; }
 REPAIR_LOCK_OWNED=false
-if mkdir "$REPAIR_LOCK" 2>/dev/null; then REPAIR_LOCK_OWNED=true; else rmdir "$GLOBAL_LOCK" 2>/dev/null || true; echo RESULT=STOP_R16_LOCAL_REPAIR_LOCK_BUSY; exit 24; fi
+if [ "$LOCAL_REPAIR_LOCK_HELD" = 1 ]; then
+    [ -d "$REPAIR_LOCK" ] || { rmdir "$GLOBAL_LOCK" 2>/dev/null || true; echo RESULT=STOP_R18_CALLER_REPAIR_LOCK_MISSING; exit 24; }
+else
+    if mkdir "$REPAIR_LOCK" 2>/dev/null; then REPAIR_LOCK_OWNED=true; else rmdir "$GLOBAL_LOCK" 2>/dev/null || true; echo RESULT=STOP_R16_LOCAL_REPAIR_LOCK_BUSY; exit 24; fi
+fi
 
 TXN_ID="$(date -u +%Y%m%d-%H%M%S)-${GEN_ID}"
 TXN_DIR="$STATE_DIR/$TXN_ID"
@@ -137,7 +171,7 @@ AUTHORIZATION_FILE="$CONSUMED_AUTH"
 early_exit() {
     rc=$?
     trap - EXIT HUP INT TERM
-    rmdir "$REPAIR_LOCK" 2>/dev/null || true
+    [ "$REPAIR_LOCK_OWNED" = true ] && rmdir "$REPAIR_LOCK" 2>/dev/null || true
     rmdir "$GLOBAL_LOCK" 2>/dev/null || true
     if [ "$rc" -ne 0 ]; then
         echo "TRANSACTION_DIR=$TXN_DIR"
@@ -154,6 +188,9 @@ cp -p "$NETWORK_CONFIG" "$TXN_DIR/backup/network"
 cp -p "$REG_STATE_KV" "$TXN_DIR/backup/state.kv" 2>/dev/null || : > "$TXN_DIR/backup/state.kv"
 COUNTER_FILE="$(reg_counter_file "$REG_REPAIR_EVENTS_KEY")"
 if [ -e "$COUNTER_FILE" ]; then cp -p "$COUNTER_FILE" "$TXN_DIR/backup/repair-counter"; echo true > "$TXN_DIR/backup/repair-counter.existed"; else : > "$TXN_DIR/backup/repair-counter"; echo false > "$TXN_DIR/backup/repair-counter.existed"; fi
+if [ -e "$REG_QUARANTINE_TSV" ]; then cp -p "$REG_QUARANTINE_TSV" "$TXN_DIR/backup/quarantine.tsv"; echo true > "$TXN_DIR/backup/quarantine.existed"; else : > "$TXN_DIR/backup/quarantine.tsv"; echo false > "$TXN_DIR/backup/quarantine.existed"; fi
+printf '%s\n' "$PREVIOUS_ACTIVE_EXISTS" > "$TXN_DIR/backup/active-link.existed"
+printf '%s\n' "$PREVIOUS_ACTIVE_TARGET" > "$TXN_DIR/backup/active-link.target"
 printf 'iface\tendpoint\n' > "$BASELINE"
 printf 'iface\tendpoint\n' > "$EXPECTED"
 
@@ -210,7 +247,11 @@ verify_routes() {
     done
 }
 service_was_running=false
-if [ -x "$HEALTH_SERVICE" ] && "$HEALTH_SERVICE" running >/dev/null 2>&1; then service_was_running=true; fi
+service_restart_required=false
+if [ -x "$HEALTH_SERVICE" ] && "$HEALTH_SERVICE" running >/dev/null 2>&1; then
+    service_was_running=true
+    [ "$HEALTH_SERVICE_MANAGED_BY_CALLER" = 1 ] || service_restart_required=true
+fi
 
 n=1
 while [ "$n" -le 5 ]; do
@@ -230,6 +271,17 @@ cleanup_locks() {
     [ "$REPAIR_LOCK_OWNED" = true ] && rmdir "$REPAIR_LOCK" 2>/dev/null || true
     rmdir "$GLOBAL_LOCK" 2>/dev/null || true
 }
+restore_active_link() {
+    rm -f "${GENERATION_ACTIVE_LINK}.r16-new.$$" "${GENERATION_ACTIVE_LINK}.r18-new.$$"
+    if [ "$(cat "$TXN_DIR/backup/active-link.existed")" = true ]; then
+        target="$(cat "$TXN_DIR/backup/active-link.target")"
+        ln -s "$target" "${GENERATION_ACTIVE_LINK}.r18-new.$$"
+        rm -f "$GENERATION_ACTIVE_LINK"
+        mv "${GENERATION_ACTIVE_LINK}.r18-new.$$" "$GENERATION_ACTIVE_LINK"
+    else
+        rm -f "$GENERATION_ACTIVE_LINK"
+    fi
+}
 restore_state() {
     cp -p "$TXN_DIR/backup/state.kv" "${REG_STATE_KV}.r16-restore.$$" && mv "${REG_STATE_KV}.r16-restore.$$" "$REG_STATE_KV"
     if [ "$(cat "$TXN_DIR/backup/repair-counter.existed")" = true ]; then
@@ -237,6 +289,12 @@ restore_state() {
     else
         rm -f "$COUNTER_FILE"
     fi
+    if [ "$(cat "$TXN_DIR/backup/quarantine.existed")" = true ]; then
+        cp -p "$TXN_DIR/backup/quarantine.tsv" "${REG_QUARANTINE_TSV}.r18-restore.$$" && mv "${REG_QUARANTINE_TSV}.r18-restore.$$" "$REG_QUARANTINE_TSV"
+    else
+        rm -f "$REG_QUARANTINE_TSV"
+    fi
+    restore_active_link
 }
 apply_runtime_default() {
     source_network="$1"
@@ -255,8 +313,7 @@ apply_runtime_default() {
 rollback_runtime() {
     set +e
     : > "$ROLLBACK_LOG"
-    rm -f "${GENERATION_ACTIVE_LINK}.r16-new.$$"
-    [ ! -e "$GENERATION_ACTIVE_LINK" ] || rm -f "$GENERATION_ACTIVE_LINK"
+    rm -f "${GENERATION_ACTIVE_LINK}.r16-new.$$" "${GENERATION_ACTIVE_LINK}.r18-new.$$"
     if [ -n "$APPLY_NETWORK_HOOK" ]; then
         "$APPLY_NETWORK_HOOK" rollback "$TXN_DIR/backup/network" "$TXN_DIR" >>"$ROLLBACK_LOG" 2>&1
         rr=$?
@@ -288,7 +345,7 @@ rollback_runtime() {
     else
         echo 'STATE_ROLLBACK_SKIPPED=runtime_not_proven_restored' >>"$ROLLBACK_LOG"
     fi
-    if [ "$service_was_running" = true ]; then
+    if [ "$service_restart_required" = true ]; then
         [ -x "$HEALTH_SERVICE" ] || health_ok=false
         "$HEALTH_SERVICE" start >>"$ROLLBACK_LOG" 2>&1 || health_ok=false
         "$SLEEP_BIN" 1
@@ -388,7 +445,7 @@ fi
 
 printf '>>> stop health repair service and apply complete prepared network\n'
 RUNTIME_MUTATED=true
-[ "$service_was_running" = true ] && "$HEALTH_SERVICE" stop >/dev/null 2>&1 || true
+[ "$service_restart_required" = true ] && "$HEALTH_SERVICE" stop >/dev/null 2>&1 || true
 if [ -n "$APPLY_NETWORK_HOOK" ]; then
     "$APPLY_NETWORK_HOOK" apply "$TXN_DIR/uci/network" "$TXN_DIR"
 else
@@ -408,8 +465,20 @@ done
 verify_routes || { echo RESULT=STOP_R16_ROUTE_OR_RULE_VERIFY_FAILED; exit 27; }
 
 printf '>>> commit active symlink and reset repair state only after complete proof\n'
-ln -s "$GEN_DIR" "${GENERATION_ACTIVE_LINK}.r16-new.$$"
-mv "${GENERATION_ACTIVE_LINK}.r16-new.$$" "$GENERATION_ACTIVE_LINK"
+LINK_TMP="${GENERATION_ACTIVE_LINK}.r16-new.$$"
+[ "$OPERATION" = replace_active_generation ] && LINK_TMP="${GENERATION_ACTIVE_LINK}.r18-new.$$"
+ln -s "$GEN_DIR" "$LINK_TMP"
+rm -f "$GENERATION_ACTIVE_LINK"
+mv "$LINK_TMP" "$GENERATION_ACTIVE_LINK"
+if [ "$OPERATION" = replace_active_generation ]; then
+    QUARANTINE_ARCHIVE_DIR="$REG_STATE_DIR/quarantine-archive"
+    mkdir -p "$QUARANTINE_ARCHIVE_DIR"
+    chmod 700 "$QUARANTINE_ARCHIVE_DIR"
+    QUARANTINE_ARCHIVE="$QUARANTINE_ARCHIVE_DIR/${NOW_EPOCH}-${AUTH_PREVIOUS_GEN_ID}-to-${GEN_ID}.tsv"
+    cp -p "$TXN_DIR/backup/quarantine.tsv" "$QUARANTINE_ARCHIVE"
+    printf 'ts_epoch\tts_utc\tegress\tiface\tendpoint\treplacement\treason\tpool_path\tpool_mtime_epoch\tsource_step\n' > "$REG_QUARANTINE_TSV"
+    chmod 600 "$REG_QUARANTINE_TSV" "$QUARANTINE_ARCHIVE"
+fi
 reg_repair_events_reset || { echo RESULT=STOP_R16_REPAIR_COUNTER_RESET_FAILED; exit 28; }
 reg_set_state mode NORMAL || { echo RESULT=STOP_R16_STATE_MODE_FAILED; exit 28; }
 reg_set_state active_generation_id "$GEN_ID" || { echo RESULT=STOP_R16_STATE_GENERATION_FAILED; exit 28; }
@@ -419,8 +488,12 @@ reg_set_state full_refresh_due false || { echo RESULT=STOP_R16_STATE_REFRESH_DUE
 [ "$(reg_repair_events_get)" = 0 ] || { echo RESULT=STOP_R16_REPAIR_COUNTER_NOT_ZERO; exit 28; }
 [ "$(readlink -f "$GENERATION_ACTIVE_LINK")" = "$(readlink -f "$GEN_DIR")" ] || { echo RESULT=STOP_R16_ACTIVE_LINK_VERIFY_FAILED; exit 28; }
 
+ACTIVATION_RESULT=PASS_R16_GENERATION_ACTIVATED
+[ "$OPERATION" = replace_active_generation ] && ACTIVATION_RESULT=PASS_R18_GENERATION_REPLACED
 cat > "$TXN_DIR/activation.kv" <<ACT
-result=PASS_R16_GENERATION_ACTIVATED
+result=$ACTIVATION_RESULT
+operation=$OPERATION
+previous_generation_id=$AUTH_PREVIOUS_GEN_ID
 generation_id=$GEN_ID
 generation_dir=$GEN_DIR
 active_link=$GENERATION_ACTIVE_LINK
@@ -428,6 +501,7 @@ repair_events_since_full_refresh=0
 authorization_id=$AUTH_ID
 authorization_consumed=true
 service_was_running=$service_was_running
+service_managed_by_caller=$HEALTH_SERVICE_MANAGED_BY_CALLER
 runtime_impact=true
 ACT
 cat > "$TXN_DIR/rollback.sh" <<ROLLBACK
@@ -436,6 +510,7 @@ set -eu
 TXN_DIR='$TXN_DIR'
 NETWORK_CONFIG='$NETWORK_CONFIG'
 GENERATION_ACTIVE_LINK='$GENERATION_ACTIVE_LINK'
+REG_QUARANTINE_TSV='$REG_QUARANTINE_TSV'
 STATE_HELPER='$STATE_HELPER'
 SLOTS_CONF='$SLOTS_CONF'
 SLOTS_APPLY='$SLOTS_APPLY'
@@ -459,7 +534,15 @@ mkdir "\$REPAIR_LOCK" 2>/dev/null || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_REPA
 repair_owned=true
 "\$HEALTH_SERVICE" stop >/dev/null 2>&1 || true
 cp -p "\$TXN_DIR/backup/network" "\${NETWORK_CONFIG}.manual-rollback.tmp"; mv "\${NETWORK_CONFIG}.manual-rollback.tmp" "\$NETWORK_CONFIG"
-rm -f "\$GENERATION_ACTIVE_LINK"
+rm -f "\${GENERATION_ACTIVE_LINK}.manual-rollback-new.$$"
+if [ "\$(cat "\$TXN_DIR/backup/active-link.existed")" = true ]; then
+  target="\$(cat "\$TXN_DIR/backup/active-link.target")"
+  ln -s "\$target" "\${GENERATION_ACTIVE_LINK}.manual-rollback-new.$$"
+  rm -f "\$GENERATION_ACTIVE_LINK"
+  mv "\${GENERATION_ACTIVE_LINK}.manual-rollback-new.$$" "\$GENERATION_ACTIVE_LINK"
+else
+  rm -f "\$GENERATION_ACTIVE_LINK"
+fi
 for iface in vpn1 vpn2 vpn3 vpn4 vpn5; do "\$IFDOWN_BIN" "\$iface" >/dev/null 2>&1 || true; "\$IFUP_BIN" "\$iface" >/dev/null 2>&1 || exit 2; "\$SLEEP_BIN" 3; done
 "\$SLOTS_APPLY" start >/dev/null 2>&1
 for n in 1 2 3 4 5; do
@@ -478,7 +561,8 @@ done
 cp -p "\$TXN_DIR/backup/state.kv" "\${REG_STATE_KV}.manual-rollback.tmp"; mv "\${REG_STATE_KV}.manual-rollback.tmp" "\$REG_STATE_KV"
 COUNTER_FILE="\$(reg_counter_file "\$REG_REPAIR_EVENTS_KEY")"
 if [ "\$(cat "\$TXN_DIR/backup/repair-counter.existed")" = true ]; then cp -p "\$TXN_DIR/backup/repair-counter" "\${COUNTER_FILE}.manual-rollback.tmp"; mv "\${COUNTER_FILE}.manual-rollback.tmp" "\$COUNTER_FILE"; else rm -f "\$COUNTER_FILE"; fi
-if [ '$service_was_running' = true ]; then
+if [ "\$(cat "\$TXN_DIR/backup/quarantine.existed")" = true ]; then cp -p "\$TXN_DIR/backup/quarantine.tsv" "\${REG_QUARANTINE_TSV}.manual-rollback.tmp"; mv "\${REG_QUARANTINE_TSV}.manual-rollback.tmp" "\$REG_QUARANTINE_TSV"; else rm -f "\$REG_QUARANTINE_TSV"; fi
+if [ '$service_restart_required' = true ]; then
   "\$HEALTH_SERVICE" start >/dev/null 2>&1
   "\$SLEEP_BIN" 1
   "\$HEALTH_SERVICE" running >/dev/null 2>&1
@@ -486,13 +570,14 @@ fi
 echo RESULT=PASS_R16_MANUAL_RUNTIME_ROLLBACK
 ROLLBACK
 chmod 700 "$TXN_DIR/rollback.sh"
-if [ "$service_was_running" = true ]; then
+if [ "$service_restart_required" = true ]; then
     "$HEALTH_SERVICE" start >/dev/null 2>&1 || { echo RESULT=STOP_R16_HEALTH_SERVICE_RESTART_FAILED; exit 28; }
     "$SLEEP_BIN" 1
     "$HEALTH_SERVICE" running >/dev/null 2>&1 || { echo RESULT=STOP_R16_HEALTH_SERVICE_NOT_RUNNING_AFTER_RESTART; exit 28; }
 fi
 COMMITTED=true
-printf 'RESULT=PASS_R16_GENERATION_ACTIVATED\n'
+printf 'RESULT=%s\n' "$ACTIVATION_RESULT"
+printf 'ACTIVATION_OPERATION=%s\n' "$OPERATION"
 printf 'GENERATION_ID=%s\n' "$GEN_ID"
 printf 'GENERATION_DIR=%s\n' "$GEN_DIR"
 printf 'ACTIVE_LINK=%s\n' "$GENERATION_ACTIVE_LINK"
@@ -502,6 +587,7 @@ printf 'REPAIR_COUNTER_RESET=true\n'
 printf 'AUTHORIZATION_ID=%s\n' "$AUTH_ID"
 printf 'AUTHORIZATION_CONSUMED=true\n'
 printf 'ACTIVE_SLOT_COUNT=5\n'
+[ "$OPERATION" = replace_active_generation ] && printf 'PREVIOUS_GENERATION_ID=%s\n' "$AUTH_PREVIOUS_GEN_ID"
 printf 'RUNTIME_IMPACT=true\n'
 exec >&3
 cat "$RUN_LOG"

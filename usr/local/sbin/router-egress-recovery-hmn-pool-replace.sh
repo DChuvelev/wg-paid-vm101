@@ -140,7 +140,16 @@ if [ "$rc" -eq 0 ] \
 
                 if [ -n "$global_count" ]; then
                     now="$(reg_now_epoch 2>/dev/null || date +%s)"
-                    if reg_set_state mode LOCAL_REPAIR_READY >/dev/null 2>&1 \
+                    current_mode="$(reg_get_state mode NORMAL 2>/dev/null || echo NORMAL)"
+                    if [ "$full_refresh_due" = true ]; then
+                        case "$current_mode" in
+                            DEGRADED_POOL_PENDING) next_mode=DEGRADED_POOL_PENDING ;;
+                            *) next_mode=FULL_POOL_REFRESH_PENDING ;;
+                        esac
+                    else
+                        next_mode=NORMAL
+                    fi
+                    if reg_set_state mode "$next_mode" >/dev/null 2>&1 \
                         && reg_set_state last_repair_epoch "$now" >/dev/null 2>&1 \
                         && reg_set_state last_repair_egress "$egress" >/dev/null 2>&1 \
                         && reg_set_state last_repair_iface "$iface" >/dev/null 2>&1 \
