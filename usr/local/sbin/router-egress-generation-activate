@@ -17,7 +17,9 @@ PING_BIN="${PING_BIN:-ping}"
 AWG_BIN="${AWG_BIN:-amneziawg}"
 SLEEP_BIN="${SLEEP_BIN:-sleep}"
 POST_UP_SLEEP_SEC="${POST_UP_SLEEP_SEC:-8}"
-STATE_DIR="${ROUTER_EGRESS_ACTIVATION_STATE_DIR:-/var/lib/router-egress-recovery/activations}"
+ACTIVATION_STATE_DIR="${ROUTER_EGRESS_ACTIVATION_STATE_DIR:-/var/lib/router-egress-recovery/activations}"
+# Keep the recovery-state namespace independent from the activation transaction directory.
+REG_STATE_DIR="${REG_STATE_DIR:-/var/lib/router-egress-recovery}"
 AUTHORIZATION_DIR="${ROUTER_EGRESS_ACTIVATION_AUTH_DIR:-/var/lib/router-egress-recovery/activation-authorizations}"
 AUTHORIZATION_FILE=""
 AUTHORIZATION_MAX_FUTURE_SEC="${ROUTER_EGRESS_AUTHORIZATION_MAX_FUTURE_SEC:-60}"
@@ -150,8 +152,8 @@ else
 fi
 
 reg_init_state || { echo RESULT=STOP_R16_STATE_INIT_FAILED; exit 24; }
-mkdir -p "$STATE_DIR" "$REG_LOCK_DIR" "$AUTHORIZATION_DIR"
-chmod 700 "$STATE_DIR" "$REG_LOCK_DIR" "$AUTHORIZATION_DIR"
+mkdir -p "$ACTIVATION_STATE_DIR" "$REG_LOCK_DIR" "$AUTHORIZATION_DIR"
+chmod 700 "$ACTIVATION_STATE_DIR" "$REG_LOCK_DIR" "$AUTHORIZATION_DIR"
 GLOBAL_LOCK="$REG_LOCK_DIR/generation-activation.lock"
 COORDINATOR_LOCK="$REG_LOCK_DIR/recovery-coordinator.lock"
 FULL_REFRESH_LOCK="$REG_LOCK_DIR/full-pool-refresh.lock"
@@ -171,7 +173,7 @@ if [ "$OPERATION" = initial_activation ]; then
 fi
 
 TXN_ID="$(date -u +%Y%m%d-%H%M%S)-${GEN_ID}"
-TXN_DIR="$STATE_DIR/$TXN_ID"
+TXN_DIR="$ACTIVATION_STATE_DIR/$TXN_ID"
 mkdir -p "$TXN_DIR/backup" "$TXN_DIR/uci"
 chmod 700 "$TXN_DIR" "$TXN_DIR/backup" "$TXN_DIR/uci"
 CONSUMED_AUTH="$TXN_DIR/authorization.consumed.kv"
