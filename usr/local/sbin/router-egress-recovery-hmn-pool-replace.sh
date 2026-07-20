@@ -54,9 +54,11 @@ fi
 tmp_base="/tmp/router-egress-recovery-hmn-wrapper.$$"
 out="${tmp_base}.out"
 err="${tmp_base}.err"
+coordinator_lock=""
+coordinator_lock_owned=false
 operation_lock=""
 operation_lock_owned=false
-trap 'rm -f "$out" "$err"; [ "$operation_lock_owned" = "true" ] && rmdir "$operation_lock" 2>/dev/null || true' EXIT HUP INT TERM
+trap 'rm -f "$out" "$err"; [ "$operation_lock_owned" = "true" ] && reg_lock_release "$operation_lock" >/dev/null 2>&1 || true; [ "$coordinator_lock_owned" = "true" ] && reg_lock_release "$coordinator_lock" >/dev/null 2>&1 || true' EXIT HUP INT TERM
 
 if [ ! -x "$ADAPTER_CORE" ]; then
     echo "adapter_core_missing=$ADAPTER_CORE" >&2
@@ -66,22 +68,29 @@ if [ ! -r "$HELPER" ]; then
     echo "state_helper_missing=$HELPER" >&2
     exit 24
 fi
+# shellcheck disable=SC1090
+. "$HELPER"
 
 if [ "$apply_requested" = "true" ] && [ "$dry_run" = "false" ]; then
-    recovery_state_dir="${STATE_DIR:-/var/lib/router-egress-recovery}"
-    mkdir -p "$recovery_state_dir/locks" 2>/dev/null || {
-        echo '{"schema":"router-egress-hmn-slot-replace-v4","decision":"refuse","reason":"local_repair_lock_dir_failed","apply_performed":false}'
+    reg_init_state >/dev/null 2>&1 || {
+        echo '{"schema":"router-egress-hmn-slot-replace-v4","decision":"refuse","reason":"local_repair_state_init_failed","apply_performed":false}'
         exit 32
     }
-    operation_lock="$recovery_state_dir/locks/local-repair.lock"
-    if ! mkdir "$operation_lock" 2>/dev/null; then
+    coordinator_lock="$(reg_lock_acquire recovery-coordinator.lock local-repair 2>/dev/null || true)"
+    if [ -z "$coordinator_lock" ]; then
+        echo '{"schema":"router-egress-hmn-slot-replace-v4","decision":"refuse","reason":"recovery_coordinator_lock_busy","apply_performed":false}'
+        exit 32
+    fi
+    coordinator_lock_owned=true
+    operation_lock="$(reg_lock_acquire local-repair.lock local-repair 2>/dev/null || true)"
+    if [ -z "$operation_lock" ]; then
         echo '{"schema":"router-egress-hmn-slot-replace-v4","decision":"refuse","reason":"local_repair_lock_busy","apply_performed":false}'
         exit 32
     fi
     operation_lock_owned=true
 fi
 
-ROUTER_EGRESS_LOCAL_REPAIR_LOCK_HELD=1 "$ADAPTER_CORE" "$@" >"$out" 2>"$err"
+ROUTER_EGRESS_COORDINATOR_LOCK_HELD=1 ROUTER_EGRESS_LOCAL_REPAIR_LOCK_HELD=1 "$ADAPTER_CORE" "$@" >"$out" 2>"$err"
 rc=$?
 
 decision="$(sed -n 's/.*"decision": "\([^"]*\)".*/\1/p' "$out" 2>/dev/null | tail -n 1)"
@@ -113,8 +122,6 @@ if [ "$rc" -eq 0 ] \
     && [ -n "$new_ep" ] \
     && [ "$old_ep" != "$new_ep" ]; then
 
-    # shellcheck disable=SC1090
-    . "$HELPER"
     if reg_init_state >/dev/null 2>&1; then
         state_lock="${REG_LOCK_DIR}/local-repair-state.lock"
         state_txn_dir="/tmp/router-egress-repair-state-txn.$$"
@@ -141,22 +148,16 @@ if [ "$rc" -eq 0 ] \
                 if [ -n "$global_count" ]; then
                     now="$(reg_now_epoch 2>/dev/null || date +%s)"
                     current_mode="$(reg_get_state mode NORMAL 2>/dev/null || echo NORMAL)"
-                    if [ "$full_refresh_due" = true ]; then
-                        case "$current_mode" in
-                            DEGRADED_POOL_PENDING) next_mode=DEGRADED_POOL_PENDING ;;
-                            *) next_mode=FULL_POOL_REFRESH_PENDING ;;
-                        esac
-                    else
-                        next_mode=NORMAL
-                    fi
-                    if reg_set_state mode "$next_mode" >/dev/null 2>&1 \
-                        && reg_set_state last_repair_epoch "$now" >/dev/null 2>&1 \
-                        && reg_set_state last_repair_egress "$egress" >/dev/null 2>&1 \
-                        && reg_set_state last_repair_iface "$iface" >/dev/null 2>&1 \
-                        && reg_set_state last_repair_old_endpoint "$old_ep" >/dev/null 2>&1 \
-                        && reg_set_state last_repair_new_endpoint "$new_ep" >/dev/null 2>&1 \
-                        && reg_set_state repair_events_since_full_refresh "$global_count" >/dev/null 2>&1 \
-                        && reg_set_state full_refresh_due "$full_refresh_due" >/dev/null 2>&1; then
+                    case "$current_mode" in
+                        DEGRADED_POOL|DEGRADED_POOL_PENDING)
+                            next_mode=DEGRADED_POOL
+                            full_refresh_due=true
+                            ;;
+                        *)
+                            if [ "$full_refresh_due" = true ]; then next_mode=FULL_POOL_REFRESH_PENDING; else next_mode=NORMAL; fi
+                            ;;
+                    esac
+                    if reg_state_update mode "$next_mode" last_repair_epoch "$now" last_repair_egress "$egress" last_repair_iface "$iface" last_repair_old_endpoint "$old_ep" last_repair_new_endpoint "$new_ep" repair_events_since_full_refresh "$global_count" full_refresh_due "$full_refresh_due" >/dev/null 2>&1; then
                         record_ok=true
                     fi
                 fi
@@ -167,7 +168,11 @@ if [ "$rc" -eq 0 ] \
                 head -n "$quarantine_lines" "$REG_QUARANTINE_TSV" >"${REG_QUARANTINE_TSV}.restore.$$" 2>/dev/null \
                     && mv "${REG_QUARANTINE_TSV}.restore.$$" "$REG_QUARANTINE_TSV" \
                     || restore_failed=true
-                cp -p "$state_txn_dir/state.kv.before" "$REG_STATE_KV" 2>/dev/null || restore_failed=true
+                if [ -s "$state_txn_dir/state.kv.before" ]; then
+                    reg_state_commit_candidate "$state_txn_dir/state.kv.before" >/dev/null 2>&1 || restore_failed=true
+                else
+                    restore_failed=true
+                fi
 
                 if [ "$(cat "$state_txn_dir/global.existed")" = "1" ]; then
                     cp -p "$state_txn_dir/global.before" "$global_file" 2>/dev/null || restore_failed=true

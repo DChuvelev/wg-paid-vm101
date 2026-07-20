@@ -23,6 +23,8 @@ AUTHORIZATION_FILE=""
 AUTHORIZATION_MAX_FUTURE_SEC="${ROUTER_EGRESS_AUTHORIZATION_MAX_FUTURE_SEC:-60}"
 HANDSHAKE_MAX_AGE_SEC="${ROUTER_EGRESS_HANDSHAKE_MAX_AGE_SEC:-300}"
 LOCAL_REPAIR_LOCK_HELD="${ROUTER_EGRESS_LOCAL_REPAIR_LOCK_HELD:-0}"
+COORDINATOR_LOCK_HELD="${ROUTER_EGRESS_COORDINATOR_LOCK_HELD:-0}"
+FULL_POOL_REFRESH_LOCK_HELD="${ROUTER_EGRESS_FULL_POOL_REFRESH_LOCK_HELD:-0}"
 HEALTH_SERVICE_MANAGED_BY_CALLER="${ROUTER_EGRESS_HEALTH_SERVICE_MANAGED_BY_CALLER:-0}"
 BUILD_NETWORK_HOOK="${ROUTER_EGRESS_BUILD_NETWORK_HOOK:-}"
 APPLY_NETWORK_HOOK="${ROUTER_EGRESS_APPLY_NETWORK_HOOK:-}"
@@ -101,7 +103,7 @@ case "$AUTH_SCHEMA" in
     router-egress-activation-authorization-v2)
         OPERATION=replace_active_generation
         [ "$AUTH_OPERATION" = replace_active_generation ] || { echo RESULT=STOP_R18_AUTHORIZATION_OPERATION; exit 22; }
-        [ "$AUTH_SOURCE_STEP" = STEP_050M07R18_FULL_POOL_REFRESH_TRIGGER_AND_TRANSACTIONAL_REPLACEMENT_R01 ] || { echo RESULT=STOP_R18_AUTHORIZATION_SOURCE_STEP; exit 22; }
+        case "$AUTH_SOURCE_STEP" in STEP_050M07R18_FULL_POOL_REFRESH_TRIGGER_AND_TRANSACTIONAL_REPLACEMENT_R01|STEP_050M07R20C_DURABLE_DEGRADED_POOL_AND_CONTROLLED_RETRY) ;; *) echo RESULT=STOP_R18_AUTHORIZATION_SOURCE_STEP; exit 22 ;; esac
         case "$AUTH_TRIGGER_COUNTER" in ''|*[!0-9]*) echo RESULT=STOP_R18_AUTHORIZATION_TRIGGER_COUNTER; exit 22 ;; esac
         ;;
     *) echo RESULT=STOP_R16_AUTHORIZATION_SCHEMA; exit 22 ;;
@@ -151,13 +153,21 @@ reg_init_state || { echo RESULT=STOP_R16_STATE_INIT_FAILED; exit 24; }
 mkdir -p "$STATE_DIR" "$REG_LOCK_DIR" "$AUTHORIZATION_DIR"
 chmod 700 "$STATE_DIR" "$REG_LOCK_DIR" "$AUTHORIZATION_DIR"
 GLOBAL_LOCK="$REG_LOCK_DIR/generation-activation.lock"
+COORDINATOR_LOCK="$REG_LOCK_DIR/recovery-coordinator.lock"
+FULL_REFRESH_LOCK="$REG_LOCK_DIR/full-pool-refresh.lock"
 REPAIR_LOCK="$REG_LOCK_DIR/local-repair.lock"
+if [ "$OPERATION" = replace_active_generation ]; then
+    [ "$COORDINATOR_LOCK_HELD" = 1 ] && [ -d "$COORDINATOR_LOCK" ] || { echo RESULT=STOP_R20C_CALLER_COORDINATOR_LOCK_MISSING; exit 24; }
+    [ "$FULL_POOL_REFRESH_LOCK_HELD" = 1 ] && [ -d "$FULL_REFRESH_LOCK" ] || { echo RESULT=STOP_R20C_CALLER_FULL_REFRESH_LOCK_MISSING; exit 24; }
+fi
 mkdir "$GLOBAL_LOCK" 2>/dev/null || { echo RESULT=STOP_R16_ACTIVATION_LOCK_BUSY; exit 24; }
 REPAIR_LOCK_OWNED=false
-if [ "$LOCAL_REPAIR_LOCK_HELD" = 1 ]; then
-    [ -d "$REPAIR_LOCK" ] || { rmdir "$GLOBAL_LOCK" 2>/dev/null || true; echo RESULT=STOP_R18_CALLER_REPAIR_LOCK_MISSING; exit 24; }
-else
-    if mkdir "$REPAIR_LOCK" 2>/dev/null; then REPAIR_LOCK_OWNED=true; else rmdir "$GLOBAL_LOCK" 2>/dev/null || true; echo RESULT=STOP_R16_LOCAL_REPAIR_LOCK_BUSY; exit 24; fi
+if [ "$OPERATION" = initial_activation ]; then
+    if [ "$LOCAL_REPAIR_LOCK_HELD" = 1 ]; then
+        [ -d "$REPAIR_LOCK" ] || { rmdir "$GLOBAL_LOCK" 2>/dev/null || true; echo RESULT=STOP_R18_CALLER_REPAIR_LOCK_MISSING; exit 24; }
+    else
+        if mkdir "$REPAIR_LOCK" 2>/dev/null; then REPAIR_LOCK_OWNED=true; else rmdir "$GLOBAL_LOCK" 2>/dev/null || true; echo RESULT=STOP_R16_LOCAL_REPAIR_LOCK_BUSY; exit 24; fi
+    fi
 fi
 
 TXN_ID="$(date -u +%Y%m%d-%H%M%S)-${GEN_ID}"
@@ -283,7 +293,7 @@ restore_active_link() {
     fi
 }
 restore_state() {
-    cp -p "$TXN_DIR/backup/state.kv" "${REG_STATE_KV}.r16-restore.$$" && mv "${REG_STATE_KV}.r16-restore.$$" "$REG_STATE_KV"
+    reg_state_commit_candidate "$TXN_DIR/backup/state.kv"
     if [ "$(cat "$TXN_DIR/backup/repair-counter.existed")" = true ]; then
         cp -p "$TXN_DIR/backup/repair-counter" "${COUNTER_FILE}.r16-restore.$$" && mv "${COUNTER_FILE}.r16-restore.$$" "$COUNTER_FILE"
     else
@@ -480,11 +490,7 @@ if [ "$OPERATION" = replace_active_generation ]; then
     chmod 600 "$REG_QUARANTINE_TSV" "$QUARANTINE_ARCHIVE"
 fi
 reg_repair_events_reset || { echo RESULT=STOP_R16_REPAIR_COUNTER_RESET_FAILED; exit 28; }
-reg_set_state mode NORMAL || { echo RESULT=STOP_R16_STATE_MODE_FAILED; exit 28; }
-reg_set_state active_generation_id "$GEN_ID" || { echo RESULT=STOP_R16_STATE_GENERATION_FAILED; exit 28; }
-reg_set_state active_generation_dir "$GEN_DIR" || { echo RESULT=STOP_R16_STATE_GENERATION_DIR_FAILED; exit 28; }
-reg_set_state last_full_refresh_epoch "$NOW_EPOCH" || { echo RESULT=STOP_R16_STATE_REFRESH_EPOCH_FAILED; exit 28; }
-reg_set_state full_refresh_due false || { echo RESULT=STOP_R16_STATE_REFRESH_DUE_FAILED; exit 28; }
+reg_state_update mode NORMAL active_generation_id "$GEN_ID" active_generation_dir "$GEN_DIR" last_full_refresh_epoch "$NOW_EPOCH" last_refresh_epoch "$NOW_EPOCH" full_refresh_due false || { echo RESULT=STOP_R20C_ACTIVATION_STATE_COMMIT_FAILED; exit 28; }
 [ "$(reg_repair_events_get)" = 0 ] || { echo RESULT=STOP_R16_REPAIR_COUNTER_NOT_ZERO; exit 28; }
 [ "$(readlink -f "$GENERATION_ACTIVE_LINK")" = "$(readlink -f "$GEN_DIR")" ] || { echo RESULT=STOP_R16_ACTIVE_LINK_VERIFY_FAILED; exit 28; }
 
@@ -524,14 +530,19 @@ SLEEP_BIN='$SLEEP_BIN'
 # shellcheck disable=SC1090
 . "\$STATE_HELPER"
 reg_init_state
+COORDINATOR_LOCK="\$(reg_lock_acquire recovery-coordinator.lock manual-activation-rollback 2>/dev/null || true)"
+[ -n "\$COORDINATOR_LOCK" ] || { echo RESULT=STOP_R20C_MANUAL_ROLLBACK_COORDINATOR_BUSY; exit 2; }
+FULL_REFRESH_LOCK=""
 GLOBAL_LOCK="\$REG_LOCK_DIR/generation-activation.lock"
-REPAIR_LOCK="\$REG_LOCK_DIR/local-repair.lock"
-mkdir "\$GLOBAL_LOCK" 2>/dev/null || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_ACTIVATION_LOCK_BUSY; exit 2; }
-repair_owned=false
-cleanup(){ [ "\$repair_owned" = true ] && rmdir "\$REPAIR_LOCK" 2>/dev/null || true; rmdir "\$GLOBAL_LOCK" 2>/dev/null || true; }
+full_owned=false
+global_owned=false
+cleanup(){ [ "\$global_owned" = true ] && rmdir "\$GLOBAL_LOCK" 2>/dev/null || true; [ "\$full_owned" = true ] && reg_lock_release "\$FULL_REFRESH_LOCK" >/dev/null 2>&1 || true; reg_lock_release "\$COORDINATOR_LOCK" >/dev/null 2>&1 || true; }
 trap cleanup EXIT HUP INT TERM
-mkdir "\$REPAIR_LOCK" 2>/dev/null || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_REPAIR_LOCK_BUSY; exit 2; }
-repair_owned=true
+FULL_REFRESH_LOCK="\$(reg_lock_acquire full-pool-refresh.lock manual-activation-rollback 2>/dev/null || true)"
+[ -n "\$FULL_REFRESH_LOCK" ] || { echo RESULT=STOP_R20C_MANUAL_ROLLBACK_FULL_REFRESH_BUSY; exit 2; }
+full_owned=true
+mkdir "\$GLOBAL_LOCK" 2>/dev/null || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_ACTIVATION_LOCK_BUSY; exit 2; }
+global_owned=true
 "\$HEALTH_SERVICE" stop >/dev/null 2>&1 || true
 cp -p "\$TXN_DIR/backup/network" "\${NETWORK_CONFIG}.manual-rollback.tmp"; mv "\${NETWORK_CONFIG}.manual-rollback.tmp" "\$NETWORK_CONFIG"
 rm -f "\${GENERATION_ACTIVE_LINK}.manual-rollback-new.$$"
@@ -558,7 +569,7 @@ for n in 1 2 3 4 5; do
   for target in \$targets; do IFS="\$oldifs"; target="\$(printf '%s' "\$target"|sed 's/^[[:space:]]*//;s/[[:space:]]*\$//')"; [ -n "\$target" ] || continue; "\$PING_BIN" -I "\$iface" -c "\$count" -W "\$timeout" "\$target" >/dev/null 2>&1 || { echo RESULT=STOP_R16_MANUAL_ROLLBACK_STRICT_HEALTH; echo "IFACE=\$iface"; exit 3; }; IFS=','; done
   IFS="\$oldifs"
 done
-cp -p "\$TXN_DIR/backup/state.kv" "\${REG_STATE_KV}.manual-rollback.tmp"; mv "\${REG_STATE_KV}.manual-rollback.tmp" "\$REG_STATE_KV"
+reg_state_commit_candidate "\$TXN_DIR/backup/state.kv"
 COUNTER_FILE="\$(reg_counter_file "\$REG_REPAIR_EVENTS_KEY")"
 if [ "\$(cat "\$TXN_DIR/backup/repair-counter.existed")" = true ]; then cp -p "\$TXN_DIR/backup/repair-counter" "\${COUNTER_FILE}.manual-rollback.tmp"; mv "\${COUNTER_FILE}.manual-rollback.tmp" "\$COUNTER_FILE"; else rm -f "\$COUNTER_FILE"; fi
 if [ "\$(cat "\$TXN_DIR/backup/quarantine.existed")" = true ]; then cp -p "\$TXN_DIR/backup/quarantine.tsv" "\${REG_QUARANTINE_TSV}.manual-rollback.tmp"; mv "\${REG_QUARANTINE_TSV}.manual-rollback.tmp" "\$REG_QUARANTINE_TSV"; else rm -f "\$REG_QUARANTINE_TSV"; fi

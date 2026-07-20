@@ -16,6 +16,7 @@ WATCH_STATE_DIR="$STATE_ROOT/health-watch"
 LOG="${HEALTH_REPAIR_LOG:-/var/log/router-egress-health-repair.log}"
 DISPATCHER="${RECOVERY_DISPATCHER:-/usr/local/sbin/router-egress-recovery-dispatcher.sh}"
 FULL_REFRESH_ORCHESTRATOR="${FULL_POOL_REFRESH_ORCHESTRATOR:-/usr/local/sbin/router-egress-full-pool-refresh.sh}"
+STATE_HELPER="${RECOVERY_STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}"
 
 ONCE=false
 FORCE_SLOT=""
@@ -158,8 +159,15 @@ if [ "$ENABLED" != "1" ] && [ "$ONCE" != true ]; then
     exit 0
 fi
 
-run_full_refresh_if_due() {
+run_initial_full_refresh_if_due() {
     [ -x "$FULL_REFRESH_ORCHESTRATOR" ] || return 0
+    [ -r "$STATE_HELPER" ] || return 0
+    # Health watcher may trigger the initial threshold refresh only. Durable
+    # DEGRADED_POOL scheduling belongs exclusively to the retry controller.
+    # shellcheck disable=SC1090
+    . "$STATE_HELPER"
+    watcher_mode="$(reg_get_state mode NORMAL 2>/dev/null || echo NORMAL)"
+    [ "$watcher_mode" = FULL_POOL_REFRESH_PENDING ] || return 0
     ROUTER_EGRESS_HEALTH_SERVICE_MANAGED_BY_CALLER=1 "$FULL_REFRESH_ORCHESTRATOR" --run-if-due >"$WATCH_STATE_DIR/full-refresh-last.log.tmp" 2>&1
     rc=$?
     mv "$WATCH_STATE_DIR/full-refresh-last.log.tmp" "$WATCH_STATE_DIR/full-refresh-last.log" 2>/dev/null || true
@@ -175,6 +183,6 @@ while true; do
     run_once >"$WATCH_STATE_DIR/last.json.tmp" 2>"$WATCH_STATE_DIR/last.err.tmp" || true
     mv "$WATCH_STATE_DIR/last.json.tmp" "$WATCH_STATE_DIR/last.json" 2>/dev/null || true
     mv "$WATCH_STATE_DIR/last.err.tmp" "$WATCH_STATE_DIR/last.err" 2>/dev/null || true
-    run_full_refresh_if_due || true
+    run_initial_full_refresh_if_due || true
     sleep "$INTERVAL_SEC"
 done
