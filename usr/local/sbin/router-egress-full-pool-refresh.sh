@@ -1,5 +1,5 @@
 #!/bin/sh
-# STEP_050M07R20C_DURABLE_DEGRADED_POOL_AND_CONTROLLED_RETRY
+# STEP_050M07R20F_LONG_RUNNING_REFRESH_CLOCK_HARDENING
 set -eu
 umask 077
 
@@ -119,12 +119,14 @@ cleanup() {
             failure_active_id="$(basename "$failure_active_real" 2>/dev/null || echo "$ACTIVE_ID")"
             failure_healthy="$(vm101_count_healthy_slots 2>/dev/null || echo 0)"
             case "$failure_healthy" in ''|*[!0-9]*) failure_healthy=0 ;; esac
-            failure_degraded_since="$NOW_EPOCH"
+            failure_now_epoch="$(date +%s)"
+            case "$failure_now_epoch" in ''|*[!0-9]*) failure_now_epoch="$NOW_EPOCH" ;; esac
+            failure_degraded_since="$failure_now_epoch"
             if [ "$ENTRY_MODE" = DEGRADED_POOL ]; then
                 case "$ENTRY_DEGRADED_SINCE" in ''|*[!0-9]*) ;; *) [ "$ENTRY_DEGRADED_SINCE" -gt 0 ] && failure_degraded_since="$ENTRY_DEGRADED_SINCE" ;; esac
             fi
-            failure_next=$((NOW_EPOCH + HMN_REFRESH_RETRY_INTERVAL_SEC))
-            if reg_state_update mode DEGRADED_POOL degraded_reason "$FAILURE_CLASS" degraded_since_epoch "$failure_degraded_since" failed_attempt_id "$ATTEMPT_ID" last_refresh_result FAILED last_refresh_epoch "$NOW_EPOCH" next_refresh_epoch "$failure_next" active_generation_id "$failure_active_id" healthy_slot_count_at_failure "$failure_healthy" full_refresh_due true last_full_refresh_result FAILED last_full_refresh_failure_epoch "$NOW_EPOCH" last_full_refresh_attempt_id "$ATTEMPT_ID" >/dev/null 2>&1; then
+            failure_next=$((failure_now_epoch + HMN_REFRESH_RETRY_INTERVAL_SEC))
+            if reg_state_update mode DEGRADED_POOL degraded_reason "$FAILURE_CLASS" degraded_since_epoch "$failure_degraded_since" failed_attempt_id "$ATTEMPT_ID" last_refresh_result FAILED last_refresh_epoch "$failure_now_epoch" next_refresh_epoch "$failure_next" active_generation_id "$failure_active_id" healthy_slot_count_at_failure "$failure_healthy" full_refresh_due true last_full_refresh_result FAILED last_full_refresh_failure_epoch "$failure_now_epoch" last_full_refresh_attempt_id "$ATTEMPT_ID" >/dev/null 2>&1; then
                 DEGRADED_STATE_RECORD_OK=true
             else
                 DEGRADED_STATE_RECORD_OK=false
@@ -348,14 +350,23 @@ chmod 600 "$FILTERED_QUARANTINE"
 
 GEN_ID="$ATTEMPT_ID"
 echo ">>> [R20C] generation build and validation"
+BUILD_NOW_EPOCH="$(date +%s)"
+case "$BUILD_NOW_EPOCH" in ''|*[!0-9]*) fail STOP_R20F_BUILD_CLOCK_INVALID generation_build_clock generation_build_failure ;; esac
+[ "$BUILD_NOW_EPOCH" -ge "$NOW_EPOCH" ] || fail STOP_R20F_BUILD_CLOCK_BEFORE_ATTEMPT generation_build_clock generation_build_failure
 BUILD_LOG="$RUN_DIR/logs/generation-build.log"
-stream_command generation-build env ROUTER_EGRESS_QUARANTINE_SNAPSHOT_OVERRIDE="$FILTERED_QUARANTINE" "$BUILDER" --source-pool "$SOURCE_POOL" --generation-id "$GEN_ID" --now-epoch "$NOW_EPOCH" || fail STOP_R20C_GENERATION_BUILD_FAILED generation_build generation_build_failure
+stream_command generation-build env ROUTER_EGRESS_QUARANTINE_SNAPSHOT_OVERRIDE="$FILTERED_QUARANTINE" "$BUILDER" --source-pool "$SOURCE_POOL" --generation-id "$GEN_ID" --now-epoch "$BUILD_NOW_EPOCH" || fail STOP_R20C_GENERATION_BUILD_FAILED generation_build generation_build_failure
 GEN_DIR="$(sed -n 's/^GENERATION_DIR=//p' "$BUILD_LOG" | tail -n1)"
 [ -n "$GEN_DIR" ] && [ -d "$GEN_DIR" ] || fail STOP_R20C_GENERATION_DIR_MISSING generation_dir generation_build_failure
-"$VALIDATOR" --generation-dir "$GEN_DIR" --now-epoch "$NOW_EPOCH" >"$RUN_DIR/logs/generation-validate.log" 2>&1 || { cat "$RUN_DIR/logs/generation-validate.log"; fail STOP_R20C_GENERATION_VALIDATE_FAILED generation_validate generation_validation_failure; }
+VALIDATE_NOW_EPOCH="$(date +%s)"
+case "$VALIDATE_NOW_EPOCH" in ''|*[!0-9]*) fail STOP_R20F_VALIDATE_CLOCK_INVALID generation_validate_clock generation_validation_failure ;; esac
+[ "$VALIDATE_NOW_EPOCH" -ge "$BUILD_NOW_EPOCH" ] || fail STOP_R20F_VALIDATE_CLOCK_BEFORE_BUILD generation_validate_clock generation_validation_failure
+"$VALIDATOR" --generation-dir "$GEN_DIR" --now-epoch "$VALIDATE_NOW_EPOCH" >"$RUN_DIR/logs/generation-validate.log" 2>&1 || { cat "$RUN_DIR/logs/generation-validate.log"; fail STOP_R20C_GENERATION_VALIDATE_FAILED generation_validate generation_validation_failure; }
 grep -qx RESULT=PASS_STAGED_GENERATION_VALID "$RUN_DIR/logs/generation-validate.log" || fail STOP_R20C_GENERATION_VALIDATE_MARKER validation_marker generation_validation_failure
 
-AUTH_ID="r20c-${GEN_ID}-${NOW_EPOCH}"
+ACTIVATION_NOW_EPOCH="$(date +%s)"
+case "$ACTIVATION_NOW_EPOCH" in ''|*[!0-9]*) fail STOP_R20F_ACTIVATION_CLOCK_INVALID activation_clock transactional_activation_failure ;; esac
+[ "$ACTIVATION_NOW_EPOCH" -ge "$VALIDATE_NOW_EPOCH" ] || fail STOP_R20F_ACTIVATION_CLOCK_BEFORE_VALIDATION activation_clock transactional_activation_failure
+AUTH_ID="r20c-${GEN_ID}-${ACTIVATION_NOW_EPOCH}"
 AUTH_FILE="$GENERATION_ACTIVATION_AUTH_DIR/${AUTH_ID}.kv"
 cat >"$AUTH_FILE" <<EOF
 schema=router-egress-activation-authorization-v2
@@ -367,8 +378,8 @@ generation_manifest_sha256=$(sha256sum "$GEN_DIR/manifest.sha256" | awk '{print 
 previous_generation_id=$ACTIVE_ID
 previous_generation_dir=$ACTIVE_REAL
 trigger_counter=$COUNTER
-issued_at_epoch=$NOW_EPOCH
-expires_at_epoch=$((NOW_EPOCH + 1800))
+issued_at_epoch=$ACTIVATION_NOW_EPOCH
+expires_at_epoch=$((ACTIVATION_NOW_EPOCH + 1800))
 single_use=true
 source_step=$SOURCE_STEP
 EOF
@@ -376,7 +387,7 @@ chmod 600 "$AUTH_FILE"
 
 echo ">>> [R20C] transactional active-generation replacement"
 ACTIVATE_LOG="$RUN_DIR/logs/generation-activate.log"
-if ! stream_command generation-activate env ROUTER_EGRESS_COORDINATOR_LOCK_HELD=1 ROUTER_EGRESS_FULL_POOL_REFRESH_LOCK_HELD=1 ROUTER_EGRESS_HEALTH_SERVICE_MANAGED_BY_CALLER="${ROUTER_EGRESS_HEALTH_SERVICE_MANAGED_BY_CALLER:-0}" "$ACTIVATOR" --generation-dir "$GEN_DIR" --authorization-file "$AUTH_FILE" --confirm "ACTIVATE_${GEN_ID}" --now-epoch "$NOW_EPOCH"; then
+if ! stream_command generation-activate env ROUTER_EGRESS_COORDINATOR_LOCK_HELD=1 ROUTER_EGRESS_FULL_POOL_REFRESH_LOCK_HELD=1 ROUTER_EGRESS_HEALTH_SERVICE_MANAGED_BY_CALLER="${ROUTER_EGRESS_HEALTH_SERVICE_MANAGED_BY_CALLER:-0}" "$ACTIVATOR" --generation-dir "$GEN_DIR" --authorization-file "$AUTH_FILE" --confirm "ACTIVATE_${GEN_ID}" --now-epoch "$ACTIVATION_NOW_EPOCH"; then
     if ! grep -qx ROLLBACK_OK=true "$ACTIVATE_LOG" 2>/dev/null; then
         DEGRADED_RECORD_ALLOWED=false
         fail STOP_R20C_ACTIVATION_ROLLBACK_NOT_PROVEN activation_rollback_not_proven activation_rollback_failure
@@ -394,7 +405,10 @@ ACTIVATION_ROLLBACK_FILE="$(sed -n 's/^ROLLBACK_FILE=//p' "$ACTIVATE_LOG" | tail
 [ "$(reg_get_state full_refresh_due true)" = false ] || fail STOP_R20C_DUE_POSTCHECK due transactional_activation_failure
 
 PROVIDER_RESTORE_NEEDED=false
-reg_state_update mode NORMAL degraded_reason "" degraded_since_epoch 0 failed_attempt_id "" last_refresh_result PASS last_refresh_epoch "$NOW_EPOCH" next_refresh_epoch 0 active_generation_id "$GEN_ID" healthy_slot_count_at_failure 5 full_refresh_due false last_full_refresh_result PASS last_full_refresh_attempt_id "$ATTEMPT_ID" last_full_refresh_previous_generation "$ACTIVE_ID" last_full_refresh_new_generation "$GEN_ID" || fail STOP_R20C_SUCCESS_STATE_FINALIZATION_FAILED success_state state_update_failure
+COMPLETION_NOW_EPOCH="$(date +%s)"
+case "$COMPLETION_NOW_EPOCH" in ''|*[!0-9]*) fail STOP_R20F_COMPLETION_CLOCK_INVALID success_state state_update_failure ;; esac
+[ "$COMPLETION_NOW_EPOCH" -ge "$ACTIVATION_NOW_EPOCH" ] || fail STOP_R20F_COMPLETION_CLOCK_BEFORE_ACTIVATION success_state state_update_failure
+reg_state_update mode NORMAL degraded_reason "" degraded_since_epoch 0 failed_attempt_id "" last_refresh_result PASS last_refresh_epoch "$COMPLETION_NOW_EPOCH" next_refresh_epoch 0 active_generation_id "$GEN_ID" healthy_slot_count_at_failure 5 full_refresh_due false last_full_refresh_result PASS last_full_refresh_attempt_id "$ATTEMPT_ID" last_full_refresh_previous_generation "$ACTIVE_ID" last_full_refresh_new_generation "$GEN_ID" || fail STOP_R20C_SUCCESS_STATE_FINALIZATION_FAILED success_state state_update_failure
 COMPLETED=true
 reg_event_append full_pool_refresh PASS "$ATTEMPT_ID" "" "" "" "$ACTIVE_ID" "$GEN_ID" success "$COUNTER" 0 "active_generation_replaced=true" >/dev/null 2>&1 || true
 cat >"$RUN_DIR/result.kv" <<EOF
