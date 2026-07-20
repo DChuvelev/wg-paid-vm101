@@ -85,6 +85,9 @@ RUN_DIR=""
 PROVIDER_RESTORE_NEEDED=false
 COMPLETED=false
 FAILURE_CLASS=unknown_failure
+FAIL_RESULT=STOP_R20C_UNKNOWN_FAILURE
+FAIL_REASON=unknown_failure
+DEGRADED_STATE_RECORD_OK=not_attempted
 DEGRADED_RECORD_ALLOWED=true
 LATEST_LINK="$PROVIDER_ROOT/configs/awg1/latest"
 
@@ -121,7 +124,27 @@ cleanup() {
                 case "$ENTRY_DEGRADED_SINCE" in ''|*[!0-9]*) ;; *) [ "$ENTRY_DEGRADED_SINCE" -gt 0 ] && failure_degraded_since="$ENTRY_DEGRADED_SINCE" ;; esac
             fi
             failure_next=$((NOW_EPOCH + HMN_REFRESH_RETRY_INTERVAL_SEC))
-            reg_state_update                 mode DEGRADED_POOL                 degraded_reason "$FAILURE_CLASS"                 degraded_since_epoch "$failure_degraded_since"                 failed_attempt_id "$ATTEMPT_ID"                 last_refresh_result FAILED                 last_refresh_epoch "$NOW_EPOCH"                 next_refresh_epoch "$failure_next"                 active_generation_id "$failure_active_id"                 healthy_slot_count_at_failure "$failure_healthy"                 full_refresh_due true                 last_full_refresh_result FAILED                 last_full_refresh_failure_epoch "$NOW_EPOCH"                 last_full_refresh_attempt_id "$ATTEMPT_ID" >/dev/null 2>&1 || true
+            if reg_state_update mode DEGRADED_POOL degraded_reason "$FAILURE_CLASS" degraded_since_epoch "$failure_degraded_since" failed_attempt_id "$ATTEMPT_ID" last_refresh_result FAILED last_refresh_epoch "$NOW_EPOCH" next_refresh_epoch "$failure_next" active_generation_id "$failure_active_id" healthy_slot_count_at_failure "$failure_healthy" full_refresh_due true last_full_refresh_result FAILED last_full_refresh_failure_epoch "$NOW_EPOCH" last_full_refresh_attempt_id "$ATTEMPT_ID" >/dev/null 2>&1; then
+                DEGRADED_STATE_RECORD_OK=true
+            else
+                DEGRADED_STATE_RECORD_OK=false
+                rc=30
+            fi
+            cat >"$RUN_DIR/result.kv" <<EOF_FAILURE
+result=$FAIL_RESULT
+attempt_id=$ATTEMPT_ID
+failure_class=$FAILURE_CLASS
+stop_reason=$FAIL_REASON
+previous_generation_id=$ACTIVE_ID
+active_generation_id=$failure_active_id
+healthy_slot_count=$failure_healthy
+next_refresh_epoch=$failure_next
+degraded_state_record_ok=$DEGRADED_STATE_RECORD_OK
+direct_failopen_used=false
+EOF_FAILURE
+            reg_event_append full_pool_refresh FAILED "$ATTEMPT_ID" '' '' '' "$ACTIVE_ID" "$failure_active_id" "$FAILURE_CLASS" "$COUNTER" "$COUNTER" "degraded_state_record_ok=$DEGRADED_STATE_RECORD_OK" >/dev/null 2>&1 || true
+            echo "DEGRADED_STATE_RECORD_OK=$DEGRADED_STATE_RECORD_OK"
+            [ "$DEGRADED_STATE_RECORD_OK" = true ] || echo RESULT=STOP_R20D_DEGRADED_STATE_RECORD_FAILED
             if [ "$failure_healthy" -eq 0 ]; then
                 echo RESULT=STOP_R20C_ZERO_HEALTHY_SLOTS_OUT_OF_SCOPE
                 echo DIRECT_FAILOPEN_USED=false
@@ -247,7 +270,7 @@ stream_command() {
     return "$rc"
 }
 
-fail() { result="$1"; reason="$2"; FAILURE_CLASS="${3:-$reason}"; echo "RESULT=$result"; echo "STOP_REASON=$reason"; exit 1; }
+fail() { result="$1"; reason="$2"; FAILURE_CLASS="${3:-$reason}"; FAIL_RESULT="$result"; FAIL_REASON="$reason"; echo "RESULT=$result"; echo "STOP_REASON=$reason"; exit 1; }
 
 reg_state_update mode FULL_POOL_REFRESH_RUNNING full_refresh_due true last_full_refresh_attempt_id "$ATTEMPT_ID" last_full_refresh_started_epoch "$NOW_EPOCH" last_full_refresh_previous_generation "$ACTIVE_ID" last_full_refresh_trigger_counter "$COUNTER" || fail STOP_R20C_STATE_UPDATE_FAILED state_running state_update_failure
 
@@ -373,6 +396,7 @@ ACTIVATION_ROLLBACK_FILE="$(sed -n 's/^ROLLBACK_FILE=//p' "$ACTIVATE_LOG" | tail
 PROVIDER_RESTORE_NEEDED=false
 reg_state_update mode NORMAL degraded_reason "" degraded_since_epoch 0 failed_attempt_id "" last_refresh_result PASS last_refresh_epoch "$NOW_EPOCH" next_refresh_epoch 0 active_generation_id "$GEN_ID" healthy_slot_count_at_failure 5 full_refresh_due false last_full_refresh_result PASS last_full_refresh_attempt_id "$ATTEMPT_ID" last_full_refresh_previous_generation "$ACTIVE_ID" last_full_refresh_new_generation "$GEN_ID" || fail STOP_R20C_SUCCESS_STATE_FINALIZATION_FAILED success_state state_update_failure
 COMPLETED=true
+reg_event_append full_pool_refresh PASS "$ATTEMPT_ID" "" "" "" "$ACTIVE_ID" "$GEN_ID" success "$COUNTER" 0 "active_generation_replaced=true" >/dev/null 2>&1 || true
 cat >"$RUN_DIR/result.kv" <<EOF
 result=PASS_R20C_FULL_POOL_REFRESH
 attempt_id=$ATTEMPT_ID

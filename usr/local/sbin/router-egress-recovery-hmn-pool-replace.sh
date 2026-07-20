@@ -107,7 +107,9 @@ record_ok=false
 global_count=""
 full_refresh_due=false
 state_failure=false
-state_restore_ok=false
+state_restore_needed=false
+state_restore_ok=not_required
+state_restore_ok_json=true
 network_rollback_ok=false
 state_lock=""
 state_txn_dir=""
@@ -138,7 +140,7 @@ if [ "$rc" -eq 0 ] \
                 echo 0 >"$state_txn_dir/global.existed"
             fi
 
-            if reg_quarantine_endpoint "$old_ep" "$egress" "$iface" "$new_ep" "repair_replaced_endpoint" "$pool_path" "STEP_050M07R15A_LEGACY_EXECUTION_FREEZE_AND_CLEAN_FOUNDATION" >/dev/null 2>&1; then
+            if reg_quarantine_endpoint "$old_ep" "$egress" "$iface" "$new_ep" "repair_replaced_endpoint" "$pool_path" "router-egress-local-repair" >/dev/null 2>&1; then
                 global_count="$(reg_repair_events_inc 2>/dev/null || true)"
                 case "$global_count:$FULL_REFRESH_AFTER_REPAIRS" in
                     *[!0-9:]*) full_refresh_due=false ;;
@@ -164,6 +166,9 @@ if [ "$rc" -eq 0 ] \
             fi
 
             if [ "$record_ok" != "true" ]; then
+                state_restore_needed=true
+                state_restore_ok=failed
+                state_restore_ok_json=false
                 restore_failed=false
                 head -n "$quarantine_lines" "$REG_QUARANTINE_TSV" >"${REG_QUARANTINE_TSV}.restore.$$" 2>/dev/null \
                     && mv "${REG_QUARANTINE_TSV}.restore.$$" "$REG_QUARANTINE_TSV" \
@@ -179,7 +184,7 @@ if [ "$rc" -eq 0 ] \
                 else
                     rm -f "$global_file" 2>/dev/null || restore_failed=true
                 fi
-                [ "$restore_failed" = "false" ] && state_restore_ok=true
+                [ "$restore_failed" = "false" ] && { state_restore_ok=succeeded; state_restore_ok_json=true; }
             fi
 
             rm -rf "$state_txn_dir" 2>/dev/null || true
@@ -190,11 +195,16 @@ if [ "$rc" -eq 0 ] \
     fi
 
     mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
-    printf '%s action=record_successful_repair egress=%s iface=%s old=%s new=%s pool=%s repair_events=%s full_refresh_due=%s record_ok=%s state_restore_ok=%s\n' \
+    printf '%s action=record_successful_repair egress=%s iface=%s old=%s new=%s pool=%s repair_events=%s full_refresh_due=%s record_ok=%s state_restore_needed=%s state_restore_ok=%s\n' \
         "$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)" \
-        "$egress" "$iface" "$old_ep" "$new_ep" "$pool_path" "$global_count" "$full_refresh_due" "$record_ok" "$state_restore_ok" >>"$LOG" 2>/dev/null || true
+        "$egress" "$iface" "$old_ep" "$new_ep" "$pool_path" "$global_count" "$full_refresh_due" "$record_ok" "$state_restore_needed" "$state_restore_ok" >>"$LOG" 2>/dev/null || true
+
+    if [ "$record_ok" = "true" ]; then
+        reg_event_append local_repair PASS "" "$iface" "$old_ep" "$new_ep" "" "" repair_replaced_endpoint "$((global_count - 1))" "$global_count" "egress=$egress pool=$pool_path" >/dev/null 2>&1 || true
+    fi
 
     if [ "$record_ok" != "true" ]; then
+        reg_event_append local_repair FAILED "" "$iface" "$old_ep" "$new_ep" "" "" state_record_failed "" "$global_count" "egress=$egress rollback_pending=true" >/dev/null 2>&1 || true
         state_failure=true
         if [ -n "$rollback_file" ] && [ -x "$rollback_file" ] && "$rollback_file" >/dev/null 2>&1; then
             restored="$(uci -q get "network.${iface}.hmn_endpoint" 2>/dev/null || true)"
@@ -205,8 +215,8 @@ fi
 
 if [ "$state_failure" = "true" ]; then
     cat "$err" >&2 2>/dev/null || true
-    printf '{"schema":"router-egress-hmn-slot-replace-v4","slot":"%s","interface":"%s","current_endpoint":"%s","candidate_endpoint":"%s","pool_path":"%s","decision":"commit_failed","reason":"state_record_failed_after_network_success","apply_performed":true,"rollback_performed":true,"network_rollback_ok":%s,"state_restore_ok":%s}\n' \
-        "$egress" "$iface" "$old_ep" "$new_ep" "$pool_path" "$network_rollback_ok" "$state_restore_ok"
+    printf '{"schema":"router-egress-hmn-slot-replace-v4","slot":"%s","interface":"%s","current_endpoint":"%s","candidate_endpoint":"%s","pool_path":"%s","decision":"commit_failed","reason":"state_record_failed_after_network_success","apply_performed":true,"rollback_performed":true,"network_rollback_ok":%s,"state_restore_needed":%s,"state_restore_ok":%s,"state_restore_status":"%s"}\n' \
+        "$egress" "$iface" "$old_ep" "$new_ep" "$pool_path" "$network_rollback_ok" "$state_restore_needed" "$state_restore_ok_json" "$state_restore_ok"
     echo "state_record_failed_after_success=true network_rollback_ok=$network_rollback_ok state_restore_ok=$state_restore_ok" >&2
     exit 31
 fi

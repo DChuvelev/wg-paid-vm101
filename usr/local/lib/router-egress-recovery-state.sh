@@ -8,6 +8,8 @@ REG_STATE_KV="${REG_STATE_KV:-$REG_STATE_DIR/state.kv}"
 REG_LOCK_DIR="${REG_LOCK_DIR:-$REG_STATE_DIR/locks}"
 REG_PERSIST_DIR="${REG_PERSIST_DIR:-/etc/router-egress-recovery}"
 REG_PERSIST_STATE_KV="${REG_PERSIST_STATE_KV:-${RECOVERY_PERSIST_STATE_KV:-$REG_PERSIST_DIR/state.kv}}"
+REG_PERSIST_QUARANTINE_TSV="${REG_PERSIST_QUARANTINE_TSV:-${RECOVERY_PERSIST_QUARANTINE_TSV:-$REG_PERSIST_DIR/quarantine.tsv}}"
+REG_EVENTS_TSV="${REG_EVENTS_TSV:-${RECOVERY_PERSIST_EVENTS_TSV:-$REG_PERSIST_DIR/events.tsv}}"
 REG_STATE_SCHEMA_VERSION="${REG_STATE_SCHEMA_VERSION:-router-egress-recovery-state-v1}"
 REG_REPAIR_EVENTS_KEY="${REG_REPAIR_EVENTS_KEY:-repair_events_since_full_refresh}"
 REG_STATE_INITIALIZED=0
@@ -139,6 +141,36 @@ reg_atomic_copy() {
     mv "$reg_copy_tmp" "$reg_copy_dst"
 }
 
+
+reg_atomic_append_line() {
+    reg_append_dst="$1"
+    reg_append_line="$2"
+    reg_append_dir="$(dirname "$reg_append_dst")"
+    reg_append_tmp="${reg_append_dst}.new.$$"
+    mkdir -p "$reg_append_dir" || return 1
+    if [ -f "$reg_append_dst" ]; then cat "$reg_append_dst" >"$reg_append_tmp" || { rm -f "$reg_append_tmp"; return 1; }; else : >"$reg_append_tmp"; fi
+    printf '%s\n' "$reg_append_line" >>"$reg_append_tmp" || { rm -f "$reg_append_tmp"; return 1; }
+    chmod 600 "$reg_append_tmp" || { rm -f "$reg_append_tmp"; return 1; }
+    mv "$reg_append_tmp" "$reg_append_dst"
+}
+
+reg_event_append() {
+    reg_event_type="${1:-unknown}"
+    reg_event_result="${2:-unknown}"
+    reg_event_attempt="${3:-}"
+    reg_event_slot="${4:-}"
+    reg_event_old="${5:-}"
+    reg_event_new="${6:-}"
+    reg_event_old_gen="${7:-}"
+    reg_event_new_gen="${8:-}"
+    reg_event_reason="${9:-}"
+    reg_event_before="${10:-}"
+    reg_event_after="${11:-}"
+    reg_event_extra="${12:-}"
+    reg_event_line="$(reg_clean_tsv "$(reg_now_epoch)")	$(reg_clean_tsv "$(reg_now_utc)")	$(reg_clean_tsv "$reg_event_type")	$(reg_clean_tsv "$reg_event_result")	$(reg_clean_tsv "$reg_event_attempt")	$(reg_clean_tsv "$reg_event_slot")	$(reg_clean_tsv "$reg_event_old")	$(reg_clean_tsv "$reg_event_new")	$(reg_clean_tsv "$reg_event_old_gen")	$(reg_clean_tsv "$reg_event_new_gen")	$(reg_clean_tsv "$reg_event_reason")	$(reg_clean_tsv "$reg_event_before")	$(reg_clean_tsv "$reg_event_after")	$(reg_clean_tsv "$reg_event_extra")"
+    reg_atomic_append_line "$REG_EVENTS_TSV" "$reg_event_line"
+}
+
 reg_state_commit_candidate() {
     reg_candidate="$1"
     reg_state_validate_file "$reg_candidate" || return 1
@@ -168,10 +200,18 @@ reg_state_commit_candidate() {
 reg_init_state_unlocked() {
     mkdir -p "$REG_STATE_DIR" "$REG_COUNTER_DIR" "$REG_LOCK_DIR" "$REG_PERSIST_DIR" 2>/dev/null || return 1
     chmod 700 "$REG_STATE_DIR" "$REG_COUNTER_DIR" "$REG_LOCK_DIR" "$REG_PERSIST_DIR" 2>/dev/null || true
-    if [ ! -e "$REG_QUARANTINE_TSV" ]; then
-        printf 'ts_epoch\tts_utc\tegress\tiface\tendpoint\treplacement\treason\tpool_path\tpool_mtime_epoch\tsource_step\n' >"$REG_QUARANTINE_TSV" || return 1
-        chmod 600 "$REG_QUARANTINE_TSV" 2>/dev/null || true
+    reg_q_header='ts_epoch	ts_utc	egress	iface	endpoint	replacement	reason	pool_path	pool_mtime_epoch	source_step'
+    if [ ! -s "$REG_PERSIST_QUARANTINE_TSV" ]; then
+        if [ -s "$REG_QUARANTINE_TSV" ] && [ "$(head -n1 "$REG_QUARANTINE_TSV" 2>/dev/null)" = "$reg_q_header" ]; then
+            reg_atomic_copy "$REG_QUARANTINE_TSV" "$REG_PERSIST_QUARANTINE_TSV" || return 1
+        else
+            printf '%s\n' "$reg_q_header" >"$REG_PERSIST_QUARANTINE_TSV" || return 1
+            chmod 600 "$REG_PERSIST_QUARANTINE_TSV" 2>/dev/null || true
+        fi
     fi
+    if [ ! -s "$REG_QUARANTINE_TSV" ] || ! cmp -s "$REG_QUARANTINE_TSV" "$REG_PERSIST_QUARANTINE_TSV"; then reg_atomic_copy "$REG_PERSIST_QUARANTINE_TSV" "$REG_QUARANTINE_TSV" || return 1; fi
+    reg_e_header='ts_epoch	ts_utc	event_type	result	attempt_id	slot	old_endpoint	new_endpoint	old_generation	new_generation	reason	counter_before	counter_after	extra'
+    if [ ! -s "$REG_EVENTS_TSV" ]; then printf '%s\n' "$reg_e_header" >"$REG_EVENTS_TSV" || return 1; chmod 600 "$REG_EVENTS_TSV" 2>/dev/null || true; fi
     reg_seed="/tmp/router-egress-state-seed.$$"
     reg_candidate="/tmp/router-egress-state-candidate.$$"
     if reg_state_validate_file "$REG_STATE_KV" 2>/dev/null; then
@@ -322,10 +362,9 @@ reg_quarantine_endpoint() {
     reg_q_endpoint="$1"; reg_q_egress="${2:-}"; reg_q_iface="${3:-}"; reg_q_replacement="${4:-}"; reg_q_reason="${5:-unspecified}"; reg_q_pool="${6:-}"; reg_q_step="${7:-manual}"
     reg_init_state || return 1
     reg_q_ts="$(reg_now_epoch)"; reg_q_utc="$(reg_now_utc)"; reg_q_mtime="$(reg_pool_mtime_epoch "$reg_q_pool")"
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-        "$(reg_clean_tsv "$reg_q_ts")" "$(reg_clean_tsv "$reg_q_utc")" "$(reg_clean_tsv "$reg_q_egress")" "$(reg_clean_tsv "$reg_q_iface")" \
-        "$(reg_clean_tsv "$reg_q_endpoint")" "$(reg_clean_tsv "$reg_q_replacement")" "$(reg_clean_tsv "$reg_q_reason")" "$(reg_clean_tsv "$reg_q_pool")" \
-        "$(reg_clean_tsv "$reg_q_mtime")" "$(reg_clean_tsv "$reg_q_step")" >>"$REG_QUARANTINE_TSV"
+    reg_q_line="$(reg_clean_tsv "$reg_q_ts")	$(reg_clean_tsv "$reg_q_utc")	$(reg_clean_tsv "$reg_q_egress")	$(reg_clean_tsv "$reg_q_iface")	$(reg_clean_tsv "$reg_q_endpoint")	$(reg_clean_tsv "$reg_q_replacement")	$(reg_clean_tsv "$reg_q_reason")	$(reg_clean_tsv "$reg_q_pool")	$(reg_clean_tsv "$reg_q_mtime")	$(reg_clean_tsv "$reg_q_step")"
+    reg_atomic_append_line "$REG_PERSIST_QUARANTINE_TSV" "$reg_q_line" || return 1
+    reg_atomic_copy "$REG_PERSIST_QUARANTINE_TSV" "$REG_QUARANTINE_TSV"
 }
 
 reg_latest_quarantine_ts() { awk -F '\t' -v ep="$1" 'NR > 1 && $5 == ep { ts = $1 } END { if (ts != "") print ts }' "$REG_QUARANTINE_TSV" 2>/dev/null; }
@@ -351,7 +390,7 @@ reg_repair_events_reset() { reg_counter_set "$REG_REPAIR_EVENTS_KEY" 0 || return
 
 reg_selftest() {
     reg_test_root="/tmp/router-egress-recovery-state-selftest-$$"
-    REG_STATE_DIR="$reg_test_root/runtime"; REG_QUARANTINE_TSV="$REG_STATE_DIR/quarantine.tsv"; REG_COUNTER_DIR="$REG_STATE_DIR/fail-counter"; REG_STATE_KV="$REG_STATE_DIR/state.kv"; REG_LOCK_DIR="$REG_STATE_DIR/locks"; REG_PERSIST_DIR="$reg_test_root/persist"; REG_PERSIST_STATE_KV="$REG_PERSIST_DIR/state.kv"
+    REG_STATE_DIR="$reg_test_root/runtime"; REG_QUARANTINE_TSV="$REG_STATE_DIR/quarantine.tsv"; REG_COUNTER_DIR="$REG_STATE_DIR/fail-counter"; REG_STATE_KV="$REG_STATE_DIR/state.kv"; REG_LOCK_DIR="$REG_STATE_DIR/locks"; REG_PERSIST_DIR="$reg_test_root/persist"; REG_PERSIST_STATE_KV="$REG_PERSIST_DIR/state.kv"; REG_PERSIST_QUARANTINE_TSV="$REG_PERSIST_DIR/quarantine.tsv"; REG_EVENTS_TSV="$REG_PERSIST_DIR/events.tsv"
     mkdir -p "$reg_test_root" || return 1
     reg_init_state || return 1
     [ -s "$REG_STATE_KV" ] && [ -s "$REG_PERSIST_STATE_KV" ] || return 1
@@ -360,6 +399,10 @@ reg_selftest() {
     rm -f "$REG_STATE_KV"
     reg_init_state || return 1
     [ "$(reg_get_state mode UNKNOWN)" = DEGRADED_POOL ] || return 1
+    reg_quarantine_endpoint 1.2.3.4:1234 egress1 vpn1 5.6.7.8:5678 selftest /tmp/pool selftest >/dev/null || return 1
+    cmp -s "$REG_QUARANTINE_TSV" "$REG_PERSIST_QUARANTINE_TSV" || return 1
+    reg_event_append selftest PASS a1 vpn1 old new g0 g1 reason 0 1 extra || return 1
+    [ "$(wc -l <"$REG_EVENTS_TSV" | tr -d " ")" -ge 2 ] || return 1
     reg_repair_events_inc >/dev/null || return 1
     reg_repair_events_reset || return 1
     reg_lock="$(reg_lock_acquire recovery-coordinator.lock selftest)" || return 1

@@ -56,6 +56,7 @@ retry_tick() {
         return 0
     fi
     if [ "$retry_now" -lt "$retry_due" ]; then
+        retry_log "event=noop_not_due now_epoch=$retry_now mode=$retry_mode next_refresh_epoch=$retry_due"
         echo RESULT=NOOP_R20C_RETRY_NOT_DUE
         echo "NOW_EPOCH=$retry_now"
         echo "NEXT_REFRESH_EPOCH=$retry_due"
@@ -64,6 +65,7 @@ retry_tick() {
 
     retry_coord="$(reg_lock_acquire recovery-coordinator.lock r20c-retry-controller 2>/dev/null || true)"
     if [ -z "$retry_coord" ]; then
+        retry_log "event=noop_coordinator_busy now_epoch=$retry_now mode=$retry_mode next_refresh_epoch=$retry_due"
         echo RESULT=NOOP_R20C_RETRY_COORDINATOR_BUSY
         return 0
     fi
@@ -87,6 +89,7 @@ retry_tick() {
     retry_count=$((retry_count + 1))
     reg_state_update refresh_retry_count "$retry_count" last_retry_epoch "$retry_now" last_retry_result RUNNING || { echo RESULT=STOP_R20C_RETRY_STATE_RUNNING_FAILED; retry_release; return 20; }
 
+    retry_log "event=retry_start now_epoch=$retry_now retry_count=$retry_count mode=$retry_mode next_refresh_epoch=$retry_due"
     retry_out="/tmp/router-egress-full-refresh-retry.$$.out"
     retry_err="/tmp/router-egress-full-refresh-retry.$$.err"
     set +e
@@ -96,12 +99,13 @@ retry_tick() {
     cat "$retry_out"
     cat "$retry_err" >&2
     retry_result="$(sed -n 's/^RESULT=//p' "$retry_out" | tail -n1)"
+    retry_attempt="$(sed -n 's/^ATTEMPT_ID=//p' "$retry_out" | tail -n1)"
     rm -f "$retry_out" "$retry_err"
 
     case "$retry_result" in
         PASS_R20C_FULL_POOL_REFRESH)
             reg_state_update last_retry_result PASS refresh_retry_count 0 next_refresh_epoch 0 || { echo RESULT=STOP_R20C_RETRY_PASS_STATE_FAILED; retry_release; return 20; }
-            retry_log "result=PASS retry_count=$retry_count"
+            retry_log "event=retry_complete result=PASS retry_count=$retry_count attempt_id=$retry_attempt"
             echo RESULT=PASS_R20C_CONTROLLED_RETRY
             echo "RETRY_COUNT=$retry_count"
             retry_release
@@ -109,13 +113,13 @@ retry_tick() {
             ;;
         STOP_R20C_ZERO_HEALTHY_SLOTS_OUT_OF_SCOPE)
             reg_state_update last_retry_result OUT_OF_SCOPE_STOP || true
-            retry_log "result=OUT_OF_SCOPE_STOP retry_count=$retry_count"
+            retry_log "event=retry_complete result=OUT_OF_SCOPE_STOP retry_count=$retry_count attempt_id=$retry_attempt rc=$retry_rc"
             retry_release
             return "$retry_rc"
             ;;
         *)
             reg_state_update last_retry_result FAILED || { echo RESULT=STOP_R20C_RETRY_FAILURE_STATE_FAILED; retry_release; return 20; }
-            retry_log "result=FAILED orchestrator_result=$retry_result retry_count=$retry_count rc=$retry_rc"
+            retry_log "event=retry_complete result=FAILED orchestrator_result=$retry_result retry_count=$retry_count attempt_id=$retry_attempt rc=$retry_rc next_refresh_epoch=$(reg_get_state next_refresh_epoch 0 2>/dev/null || echo 0)"
             retry_release
             [ "$retry_rc" -ne 0 ] && return "$retry_rc"
             return 1
