@@ -54,8 +54,13 @@ emit_json() {
     echo "  \"candidate_endpoint\": \"$(json_escape "$candidate")\","
     echo "  \"adapter_dryrun_rc\": ${dry_rc},"
     echo "  \"adapter_dryrun_decision\": \"$(json_escape "$dry_decision")\","
+    echo "  \"adapter_dryrun_reason\": \"$(json_escape "$dry_reason")\","
+    echo "  \"adapter_selected_pool\": \"$(json_escape "$adapter_selected_pool")\","
+    echo "  \"adapter_selected_pool_age_sec\": ${adapter_selected_pool_age_sec},"
+    echo "  \"adapter_available_candidate_count\": ${adapter_available_candidate_count},"
     echo "  \"adapter_commit_rc\": ${commit_rc},"
     echo "  \"adapter_commit_decision\": \"$(json_escape "$commit_decision")\","
+    echo "  \"adapter_commit_reason\": \"$(json_escape "$commit_reason")\","
     echo "  \"decision\": \"$(json_escape "$decision")\","
     echo "  \"reason\": \"$(json_escape "$reason_out")\","
     echo "  \"apply_performed\": ${apply_performed},"
@@ -74,8 +79,13 @@ iface=""
 candidate=""
 dry_rc=2
 dry_decision=""
+dry_reason=""
+adapter_selected_pool=""
+adapter_selected_pool_age_sec=0
+adapter_available_candidate_count=0
 commit_rc=0
 commit_decision=""
+commit_reason=""
 decision="refuse"
 reason_out="unknown"
 apply_performed=false
@@ -98,11 +108,17 @@ dry_rc=$?
 candidate="$(printf '%s\n' "$dry_json" | sed -n 's/.*"candidate_endpoint": "\([^"]*\)".*/\1/p' | head -n 1)"
 iface="$(printf '%s\n' "$dry_json" | sed -n 's/.*"interface": "\([^"]*\)".*/\1/p' | head -n 1)"
 dry_decision="$(printf '%s\n' "$dry_json" | sed -n 's/.*"decision": "\([^"]*\)".*/\1/p' | head -n 1)"
+dry_reason="$(printf '%s\n' "$dry_json" | sed -n 's/.*"reason": "\([^"]*\)".*/\1/p' | head -n 1)"
+adapter_selected_pool="$(printf '%s\n' "$dry_json" | sed -n 's/.*"selected_pool": "\([^"]*\)".*/\1/p' | head -n 1)"
+adapter_selected_pool_age_sec="$(printf '%s\n' "$dry_json" | sed -n 's/.*"selected_pool_age_sec": \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+adapter_available_candidate_count="$(printf '%s\n' "$dry_json" | sed -n 's/.*"available_candidate_count": \([0-9][0-9]*\).*/\1/p' | head -n 1)"
+case "$adapter_selected_pool_age_sec" in ''|*[!0-9]*) adapter_selected_pool_age_sec=0 ;; esac
+case "$adapter_available_candidate_count" in ''|*[!0-9]*) adapter_available_candidate_count=0 ;; esac
 required_confirm="DISPATCH_${SLOT}_${candidate}"
 
 if [ "$dry_rc" -ne 0 ] || [ "$dry_decision" != "dry_run_ok" ] || [ -z "$candidate" ] || [ -z "$iface" ]; then
     decision="refuse"
-    reason_out="adapter_dryrun_not_ready"
+    reason_out="adapter_dryrun_not_ready_${dry_reason:-unknown}"
 elif [ "$MODE" = "--dry-run" ]; then
     decision="dry_run_ok"
     reason_out="dispatcher_ready"
@@ -115,6 +131,7 @@ elif [ "$MODE" = "--commit" ]; then
         commit_json="$($ADAPTER --commit --slot "$SLOT" --confirm "$adapter_confirm" 2>/dev/null)"
         commit_rc=$?
         commit_decision="$(printf '%s\n' "$commit_json" | sed -n 's/.*"decision": "\([^"]*\)".*/\1/p' | head -n 1)"
+        commit_reason="$(printf '%s\n' "$commit_json" | sed -n 's/.*"reason": "\([^"]*\)".*/\1/p' | head -n 1)"
         apply_performed=true
         if [ "$commit_rc" -eq 0 ] && [ "$commit_decision" = "commit_ok" ]; then
             decision="commit_ok"

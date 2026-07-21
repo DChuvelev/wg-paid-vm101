@@ -85,6 +85,11 @@ run_once() {
         action=none
         dispatcher_rc=0
         required_confirm=""
+        adapter_reason=""
+        adapter_selected_pool=""
+        adapter_selected_pool_age_sec=0
+        adapter_available_candidate_count=0
+        candidate_endpoint=""
 
         if slot_ok "$iface" "$targets" "$strict_count" "$strict_timeout"; then
             health_ok=true
@@ -101,22 +106,33 @@ run_once() {
             else
                 dry_out="/tmp/router-egress-health-dry-${slot}.$$"
                 dry_err="/tmp/router-egress-health-dry-${slot}.$$.err"
-                set +e
-                "$DISPATCHER" --dry-run --slot "$slot" --reason health_watch >"$dry_out" 2>"$dry_err"
-                dry_rc=$?
-                set -e
+                dry_rc=0
+                "$DISPATCHER" --dry-run --slot "$slot" --reason health_watch >"$dry_out" 2>"$dry_err" || dry_rc=$?
                 required_confirm="$(sed -n 's/.*"required_dispatch_confirm": "\([^"]*\)".*/\1/p' "$dry_out" | head -n1)"
                 dry_decision="$(sed -n 's/.*"decision": "\([^"]*\)".*/\1/p' "$dry_out" | head -n1)"
-                rm -f "$dry_err"
+                adapter_reason="$(sed -n 's/.*"adapter_dryrun_reason": "\([^"]*\)".*/\1/p' "$dry_out" | head -n1)"
+                adapter_selected_pool="$(sed -n 's/.*"adapter_selected_pool": "\([^"]*\)".*/\1/p' "$dry_out" | head -n1)"
+                adapter_selected_pool_age_sec="$(sed -n 's/.*"adapter_selected_pool_age_sec": \([0-9][0-9]*\).*/\1/p' "$dry_out" | head -n1)"
+                adapter_available_candidate_count="$(sed -n 's/.*"adapter_available_candidate_count": \([0-9][0-9]*\).*/\1/p' "$dry_out" | head -n1)"
+                candidate_endpoint="$(sed -n 's/.*"candidate_endpoint": "\([^"]*\)".*/\1/p' "$dry_out" | head -n1)"
+                case "$adapter_selected_pool_age_sec" in ''|*[!0-9]*) adapter_selected_pool_age_sec=0 ;; esac
+                case "$adapter_available_candidate_count" in ''|*[!0-9]*) adapter_available_candidate_count=0 ;; esac
+                cat "$dry_err" >>"$LOG" 2>/dev/null || true
 
                 if [ "$dry_rc" -eq 0 ] && [ "$dry_decision" = dry_run_ok ] && [ "$MODE" = --commit ] && [ -n "$required_confirm" ]; then
                     commit_out="/tmp/router-egress-health-commit-${slot}.$$"
                     commit_err="/tmp/router-egress-health-commit-${slot}.$$.err"
-                    set +e
-                    "$DISPATCHER" --commit --slot "$slot" --reason health_watch --confirm "$required_confirm" >"$commit_out" 2>"$commit_err"
-                    dispatcher_rc=$?
-                    set -e
+                    dispatcher_rc=0
+                    "$DISPATCHER" --commit --slot "$slot" --reason health_watch --confirm "$required_confirm" >"$commit_out" 2>"$commit_err" || dispatcher_rc=$?
                     decision="$(sed -n 's/.*"decision": "\([^"]*\)".*/\1/p' "$commit_out" | head -n1)"
+                    adapter_reason="$(sed -n 's/.*"adapter_commit_reason": "\([^"]*\)".*/\1/p' "$commit_out" | head -n1)"
+                    [ -n "$adapter_reason" ] || adapter_reason="$(sed -n 's/.*"adapter_dryrun_reason": "\([^"]*\)".*/\1/p' "$commit_out" | head -n1)"
+                    adapter_selected_pool="$(sed -n 's/.*"adapter_selected_pool": "\([^"]*\)".*/\1/p' "$commit_out" | head -n1)"
+                    adapter_selected_pool_age_sec="$(sed -n 's/.*"adapter_selected_pool_age_sec": \([0-9][0-9]*\).*/\1/p' "$commit_out" | head -n1)"
+                    adapter_available_candidate_count="$(sed -n 's/.*"adapter_available_candidate_count": \([0-9][0-9]*\).*/\1/p' "$commit_out" | head -n1)"
+                    candidate_endpoint="$(sed -n 's/.*"candidate_endpoint": "\([^"]*\)".*/\1/p' "$commit_out" | head -n1)"
+                    case "$adapter_selected_pool_age_sec" in ''|*[!0-9]*) adapter_selected_pool_age_sec=0 ;; esac
+                    case "$adapter_available_candidate_count" in ''|*[!0-9]*) adapter_available_candidate_count=0 ;; esac
                     [ -n "$decision" ] || decision=commit_failed_no_decision
                     action=commit_dispatch
                     any_action=true
@@ -139,13 +155,16 @@ run_once() {
 
         $first || printf ',\n' >>"$json"
         first=false
-        printf '    {"slot":"%s","iface":"%s","health_ok":%s,"fail_count":%s,"decision":"%s","action":"%s","dispatcher_rc":%s,"required_confirm":"%s"}' \
+        printf '    {"slot":"%s","iface":"%s","health_ok":%s,"fail_count":%s,"decision":"%s","action":"%s","dispatcher_rc":%s,"required_confirm":"%s","adapter_reason":"%s","adapter_selected_pool":"%s","adapter_selected_pool_age_sec":%s,"adapter_available_candidate_count":%s,"candidate_endpoint":"%s"}' \
             "$(json_escape "$slot")" "$(json_escape "$iface")" "$health_ok" "$fail_count" \
             "$(json_escape "$decision")" "$(json_escape "$action")" "$dispatcher_rc" \
-            "$(json_escape "$required_confirm")" >>"$json"
-        printf '%s slot=%s iface=%s health_ok=%s fail_count=%s decision=%s action=%s dispatcher_rc=%s mode=%s\n' \
+            "$(json_escape "$required_confirm")" "$(json_escape "$adapter_reason")" \
+            "$(json_escape "$adapter_selected_pool")" "$adapter_selected_pool_age_sec" \
+            "$adapter_available_candidate_count" "$(json_escape "$candidate_endpoint")" >>"$json"
+        printf '%s slot=%s iface=%s health_ok=%s fail_count=%s decision=%s action=%s dispatcher_rc=%s mode=%s adapter_reason=%s pool=%s pool_age_sec=%s candidate_count=%s candidate=%s\n' \
             "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$slot" "$iface" "$health_ok" "$fail_count" \
-            "$decision" "$action" "$dispatcher_rc" "$MODE" >>"$LOG"
+            "$decision" "$action" "$dispatcher_rc" "$MODE" "$adapter_reason" "$adapter_selected_pool" \
+            "$adapter_selected_pool_age_sec" "$adapter_available_candidate_count" "$candidate_endpoint" >>"$LOG"
     done <"$rows"
 
     printf '{\n  "schema":"router-egress-health-repair-watch-v3",\n  "mode":"%s",\n  "run_mode":"%s",\n  "any_action":%s,\n  "slots":[\n' \

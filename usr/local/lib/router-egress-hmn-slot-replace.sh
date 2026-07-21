@@ -151,6 +151,13 @@ write_result() {
         echo "  \"selected_pool_age_sec\": ${selected_pool_age_sec},"
         echo "  \"max_pool_age_sec\": ${MAX_POOL_AGE_SEC},"
         echo "  \"selected_pool_endpoint_count\": ${selected_pool_endpoint_count},"
+        echo "  \"preferred_pool_scan_count\": ${preferred_pool_scan_count},"
+        echo "  \"nonempty_pool_count\": ${nonempty_pool_count},"
+        echo "  \"stale_pool_count\": ${stale_pool_count},"
+        echo "  \"fresh_pool_count\": ${fresh_pool_count},"
+        echo "  \"fresh_pool_without_candidate_count\": ${fresh_pool_without_candidate_count},"
+        echo "  \"first_nonempty_pool\": \"$(json_escape "$first_nonempty_pool")\","
+        echo "  \"first_nonempty_pool_age_sec\": ${first_nonempty_pool_age_sec},"
         echo "  \"pool_is_fresh\": ${pool_is_fresh},"
         echo "  \"available_candidate_count\": ${candidate_count},"
         echo "  \"candidate_endpoint\": \"$(json_escape "$candidate")\","
@@ -263,35 +270,62 @@ sort -u "$used_file" -o "$used_file"
 selected_pool=""
 selected_pool_age_sec=999999999
 selected_pool_endpoint_count=0
+preferred_pool_scan_count=0
+nonempty_pool_count=0
+stale_pool_count=0
+fresh_pool_count=0
+fresh_pool_without_candidate_count=0
+first_nonempty_pool=""
+first_nonempty_pool_age_sec=999999999
+pool_is_fresh=false
+candidate_count=0
+candidate=""
+
 for name in $PREFERRED_POOL_FILES; do
+    preferred_pool_scan_count=$((preferred_pool_scan_count + 1))
     file="${HMN_CACHE_DIR}/${name}"
     [ -s "$file" ] || continue
     count="$(endpoint_count "$file")"
     [ "$count" -gt 0 ] || continue
-    selected_pool="$file"
+    nonempty_pool_count=$((nonempty_pool_count + 1))
+
     mtime="$(reg_pool_mtime_epoch "$file")"
     [ -n "$mtime" ] || mtime=0
-    selected_pool_age_sec=$((now - mtime))
-    selected_pool_endpoint_count="$count"
-    break
-done
+    age=$((now - mtime))
+    if [ -z "$first_nonempty_pool" ]; then
+        first_nonempty_pool="$file"
+        first_nonempty_pool_age_sec="$age"
+    fi
 
-pool_is_fresh=false
-candidate_count=0
-candidate=""
-if [ -n "$selected_pool" ]; then
-    [ "$selected_pool_age_sec" -le "$MAX_POOL_AGE_SEC" ] && pool_is_fresh=true
-    extract_endpoints "$selected_pool" >"$pool_file"
+    if [ "$age" -lt 0 ] || [ "$age" -gt "$MAX_POOL_AGE_SEC" ]; then
+        stale_pool_count=$((stale_pool_count + 1))
+        continue
+    fi
+    fresh_pool_count=$((fresh_pool_count + 1))
+
+    extract_endpoints "$file" >"$pool_file"
     : >"$candidate_file"
     while IFS= read -r endpoint; do
         [ -n "$endpoint" ] || continue
         grep -Fx "$endpoint" "$used_file" >/dev/null 2>&1 && continue
-        reg_endpoint_quarantined_for_pool "$endpoint" "$selected_pool" && continue
+        reg_endpoint_quarantined_for_pool "$endpoint" "$file" && continue
         printf '%s\n' "$endpoint" >>"$candidate_file"
     done <"$pool_file"
+
     candidate_count="$(wc -l <"$candidate_file" | tr -d ' ')"
     candidate="$(head -n 1 "$candidate_file" 2>/dev/null || true)"
-fi
+    if [ "$candidate_count" -gt 0 ] && [ -n "$candidate" ]; then
+        selected_pool="$file"
+        selected_pool_age_sec="$age"
+        selected_pool_endpoint_count="$count"
+        pool_is_fresh=true
+        break
+    fi
+
+    fresh_pool_without_candidate_count=$((fresh_pool_without_candidate_count + 1))
+    candidate_count=0
+    candidate=""
+done
 
 decision="refuse"
 reason="unknown"
@@ -303,8 +337,12 @@ rollback_ok=false
 rollback_file=""
 candidate_attempts=0
 
-if [ -z "$selected_pool" ]; then
+if [ -z "$selected_pool" ] && [ "$nonempty_pool_count" -eq 0 ]; then
     reason="no_pool_file"
+elif [ -z "$selected_pool" ] && [ "$fresh_pool_count" -eq 0 ]; then
+    reason="stale_pool"
+elif [ -z "$selected_pool" ]; then
+    reason="no_eligible_candidate"
 elif [ "$pool_is_fresh" != "true" ]; then
     reason="stale_pool"
 elif [ "$candidate_count" -eq 0 ] || [ -z "$candidate" ]; then
