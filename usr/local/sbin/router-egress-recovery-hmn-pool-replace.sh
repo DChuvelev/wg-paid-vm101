@@ -10,6 +10,7 @@ ADAPTER_CORE="${ROUTER_EGRESS_RECOVERY_CORE_OVERRIDE:-$ADAPTER_CORE_DEFAULT}"
 HELPER="${ROUTER_EGRESS_RECOVERY_STATE_HELPER:-${STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}}"
 LOG="${ROUTER_EGRESS_RECOVERY_STATE_LOG:-${LOG:-/var/log/router-egress-recovery-state.log}}"
 FULL_REFRESH_AFTER_REPAIRS="${FULL_REFRESH_AFTER_REPAIRS:-5}"
+AWG_BIN="${AWG_BIN:-/usr/bin/amneziawg}"
 
 egress=""
 dry_run=false
@@ -36,6 +37,17 @@ for arg in "$@"; do
 done
 
 [ "$dry_run" = "true" ] && apply_requested=false
+
+live_endpoint_for_iface() {
+    "$AWG_BIN" show "$1" endpoints 2>/dev/null | awk 'NR==1{print $NF; exit}'
+}
+
+peer_uci_endpoint_for_iface() {
+    host="$(uci -q get "network.@amneziawg_$1[0].endpoint_host" 2>/dev/null || true)"
+    port="$(uci -q get "network.@amneziawg_$1[0].endpoint_port" 2>/dev/null || true)"
+    [ -n "$host" ] && [ -n "$port" ] && printf '%s:%s\n' "$host" "$port"
+}
+
 
 case "$egress" in
     egress1) iface="vpn1" ;;
@@ -94,14 +106,35 @@ ROUTER_EGRESS_COORDINATOR_LOCK_HELD=1 ROUTER_EGRESS_LOCAL_REPAIR_LOCK_HELD=1 "$A
 rc=$?
 
 decision="$(sed -n 's/.*"decision": "\([^"]*\)".*/\1/p' "$out" 2>/dev/null | tail -n 1)"
-new_ep="${ROUTER_EGRESS_RECOVERY_NEW_ENDPOINT_OVERRIDE:-}"
-if [ -z "$new_ep" ] && [ -n "$iface" ]; then
-    new_ep="$(uci -q get "network.${iface}.hmn_endpoint" 2>/dev/null || true)"
+candidate_ep="$(sed -n 's/.*"candidate_endpoint": "\([^"]*\)".*/\1/p' "$out" 2>/dev/null | tail -n 1)"
+endpoint_consistency_ok="$(sed -n 's/.*"endpoint_consistency_ok": \([^,]*\).*/\1/p' "$out" 2>/dev/null | tail -n 1)"
+live_ep=""
+peer_ep=""
+metadata_ep=""
+if [ -n "$iface" ]; then
+    live_ep="$(live_endpoint_for_iface "$iface")"
+    peer_ep="$(peer_uci_endpoint_for_iface "$iface")"
+    metadata_ep="$(uci -q get "network.${iface}.hmn_endpoint" 2>/dev/null || true)"
 fi
+new_ep="${ROUTER_EGRESS_RECOVERY_NEW_ENDPOINT_OVERRIDE:-$live_ep}"
 
 pool_path="$(sed -n 's/.*"pool_path": "\([^"]*\)".*/\1/p' "$out" 2>/dev/null | tail -n 1)"
 [ -n "$pool_path" ] || pool_path="$(sed -n 's/.*"selected_pool": "\([^"]*\)".*/\1/p' "$out" 2>/dev/null | tail -n 1)"
 rollback_file="$(sed -n 's/.*"rollback_file": "\([^"]*\)".*/\1/p' "$out" 2>/dev/null | tail -n 1)"
+
+core_contract_failure=false
+core_contract_rollback_ok=false
+if [ "$rc" -eq 0 ] && [ "$decision" = "commit_ok" ] && [ "$apply_requested" = "true" ] && [ "$dry_run" = "false" ]; then
+    if [ -z "$candidate_ep" ] || [ "$endpoint_consistency_ok" != "true" ] || [ "$live_ep" != "$candidate_ep" ] || [ "$peer_ep" != "$candidate_ep" ] || [ "$metadata_ep" != "$candidate_ep" ]; then
+        core_contract_failure=true
+        if [ -n "$rollback_file" ] && [ -x "$rollback_file" ] && "$rollback_file" >/dev/null 2>&1; then
+            restored_live="$(live_endpoint_for_iface "$iface")"
+            restored_peer="$(peer_uci_endpoint_for_iface "$iface")"
+            restored_metadata="$(uci -q get "network.${iface}.hmn_endpoint" 2>/dev/null || true)"
+            [ "$restored_live" = "$old_ep" ] && [ "$restored_peer" = "$old_ep" ] && [ "$restored_metadata" = "$old_ep" ] && core_contract_rollback_ok=true
+        fi
+    fi
+fi
 
 record_ok=false
 global_count=""
@@ -122,7 +155,10 @@ if [ "$rc" -eq 0 ] \
     && [ -n "$iface" ] \
     && [ -n "$old_ep" ] \
     && [ -n "$new_ep" ] \
-    && [ "$old_ep" != "$new_ep" ]; then
+    && [ "$old_ep" != "$new_ep" ] \
+    && [ "$core_contract_failure" = "false" ] \
+    && [ "$candidate_ep" = "$new_ep" ] \
+    && [ "$endpoint_consistency_ok" = "true" ]; then
 
     if reg_init_state >/dev/null 2>&1; then
         state_lock="${REG_LOCK_DIR}/local-repair-state.lock"
@@ -208,9 +244,18 @@ if [ "$rc" -eq 0 ] \
         state_failure=true
         if [ -n "$rollback_file" ] && [ -x "$rollback_file" ] && "$rollback_file" >/dev/null 2>&1; then
             restored="$(uci -q get "network.${iface}.hmn_endpoint" 2>/dev/null || true)"
-            [ "$restored" = "$old_ep" ] && network_rollback_ok=true
+            restored_peer="$(peer_uci_endpoint_for_iface "$iface")"
+            restored_live="$(live_endpoint_for_iface "$iface")"
+            [ "$restored" = "$old_ep" ] && [ "$restored_peer" = "$old_ep" ] && [ "$restored_live" = "$old_ep" ] && network_rollback_ok=true
         fi
     fi
+fi
+
+if [ "$core_contract_failure" = "true" ]; then
+    cat "$err" >&2 2>/dev/null || true
+    printf '{"schema":"router-egress-hmn-slot-replace-v5","slot":"%s","interface":"%s","current_endpoint":"%s","candidate_endpoint":"%s","metadata_endpoint":"%s","peer_uci_endpoint":"%s","live_endpoint":"%s","decision":"commit_failed","reason":"adapter_reported_success_without_live_endpoint_proof","apply_performed":true,"rollback_performed":true,"network_rollback_ok":%s}\n' \
+        "$egress" "$iface" "$old_ep" "$candidate_ep" "$metadata_ep" "$peer_ep" "$live_ep" "$core_contract_rollback_ok"
+    exit 33
 fi
 
 if [ "$state_failure" = "true" ]; then

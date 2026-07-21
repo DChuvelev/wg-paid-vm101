@@ -53,6 +53,7 @@ PING_BIN="${PING_BIN:-ping}"
 IFUP_BIN="${IFUP_BIN:-ifup}"
 IFDOWN_BIN="${IFDOWN_BIN:-ifdown}"
 SLEEP_BIN="${SLEEP_BIN:-sleep}"
+AWG_BIN="${AWG_BIN:-/usr/bin/amneziawg}"
 
 mkdir -p "$STATE_DIR" "$(dirname "$LOG")" 2>/dev/null || true
 
@@ -84,22 +85,36 @@ current_endpoint_for_iface() {
     iface="$1"
     endpoint="$("$UCI_BIN" -q get "network.${iface}.hmn_endpoint" 2>/dev/null || true)"
     if [ -z "$endpoint" ]; then
-        host="$("$UCI_BIN" -q get "network.awg_${iface}.endpoint_host" 2>/dev/null || "$UCI_BIN" -q get "network.amneziawg_${iface}.endpoint_host" 2>/dev/null || true)"
-        port="$("$UCI_BIN" -q get "network.awg_${iface}.endpoint_port" 2>/dev/null || "$UCI_BIN" -q get "network.amneziawg_${iface}.endpoint_port" 2>/dev/null || true)"
-        [ -n "$host" ] && [ -n "$port" ] && endpoint="${host}:${port}"
+        endpoint="$(peer_uci_endpoint_for_iface "$iface")"
     fi
     printf '%s\n' "$endpoint"
+}
+
+peer_uci_endpoint_for_iface() {
+    iface="$1"
+    host="$("$UCI_BIN" -q get "network.@amneziawg_${iface}[0].endpoint_host" 2>/dev/null || true)"
+    port="$("$UCI_BIN" -q get "network.@amneziawg_${iface}[0].endpoint_port" 2>/dev/null || true)"
+    [ -n "$host" ] && [ -n "$port" ] && printf '%s:%s\n' "$host" "$port"
+}
+
+live_endpoint_for_iface() {
+    iface="$1"
+    "$AWG_BIN" show "$iface" endpoints 2>/dev/null | awk 'NR==1{print $NF; exit}'
 }
 
 set_endpoint_for_iface() {
     iface="$1"
     endpoint="$2"
-    if [ -n "$endpoint" ]; then
-        "$UCI_BIN" set "network.${iface}.hmn_endpoint=${endpoint}" || return 1
-    else
-        "$UCI_BIN" -q delete "network.${iface}.hmn_endpoint" 2>/dev/null || true
-    fi
-    "$UCI_BIN" commit network
+    valid_endpoint "$endpoint" || return 1
+    host="${endpoint%:*}"
+    port="${endpoint##*:}"
+    [ -n "$host" ] && [ -n "$port" ] || return 1
+    "$UCI_BIN" set "network.${iface}.hmn_endpoint=${endpoint}" || return 1
+    "$UCI_BIN" set "network.@amneziawg_${iface}[0].endpoint_host=${host}" || return 1
+    "$UCI_BIN" set "network.@amneziawg_${iface}[0].endpoint_port=${port}" || return 1
+    "$UCI_BIN" commit network || return 1
+    [ "$("$UCI_BIN" -q get "network.${iface}.hmn_endpoint" 2>/dev/null || true)" = "$endpoint" ] || return 1
+    [ "$(peer_uci_endpoint_for_iface "$iface")" = "$endpoint" ] || return 1
 }
 
 strict_ping() {
@@ -167,6 +182,10 @@ write_result() {
         echo "  \"apply_performed\": ${apply_performed},"
         echo "  \"apply_rc\": ${apply_rc},"
         echo "  \"post_strict_ok\": ${post_strict_ok},"
+        echo "  \"metadata_endpoint_after_apply\": \"$(json_escape "$metadata_endpoint_after_apply")\","
+        echo "  \"peer_uci_endpoint_after_apply\": \"$(json_escape "$peer_uci_endpoint_after_apply")\","
+        echo "  \"live_endpoint_after_apply\": \"$(json_escape "$live_endpoint_after_apply")\","
+        echo "  \"endpoint_consistency_ok\": ${endpoint_consistency_ok},"
         echo "  \"rollback_performed\": ${rollback_performed},"
         echo "  \"rollback_ok\": ${rollback_ok},"
         echo "  \"rollback_file\": \"$(json_escape "$rollback_file")\","
@@ -332,6 +351,11 @@ reason="unknown"
 apply_performed=false
 apply_rc=0
 post_strict_ok=false
+metadata_endpoint_after_apply=""
+peer_uci_endpoint_after_apply=""
+live_endpoint_after_apply=""
+endpoint_consistency_ok=false
+apply_mechanism_failed=false
 rollback_performed=false
 rollback_ok=false
 rollback_file=""
@@ -379,6 +403,8 @@ elif [ "$MODE" = "--commit" ]; then
 #!/bin/sh
 set -u
 uci set network.${iface}.hmn_endpoint='${current_ep}'
+uci set network.@amneziawg_${iface}[0].endpoint_host='${current_ep%:*}'
+uci set network.@amneziawg_${iface}[0].endpoint_port='${current_ep##*:}'
 uci commit network
 ifdown '${iface}' >/dev/null 2>&1 || true
 ifup '${iface}' >/dev/null 2>&1 || true
@@ -414,17 +440,32 @@ EOF
                 apply_rc=$?
             fi
 
-            if [ "$apply_rc" -eq 0 ] \
-                && "$IP_BIN" link show "$iface" >/dev/null 2>&1 \
+            metadata_endpoint_after_apply="$("$UCI_BIN" -q get "network.${iface}.hmn_endpoint" 2>/dev/null || true)"
+            peer_uci_endpoint_after_apply="$(peer_uci_endpoint_for_iface "$iface")"
+            live_endpoint_after_apply="$(live_endpoint_for_iface "$iface")"
+            endpoint_consistency_ok=false
+            if [ "$metadata_endpoint_after_apply" = "$candidate" ] \
+                && [ "$peer_uci_endpoint_after_apply" = "$candidate" ] \
+                && [ "$live_endpoint_after_apply" = "$candidate" ]; then
+                endpoint_consistency_ok=true
+            fi
+
+            if [ "$apply_rc" -ne 0 ] || [ "$endpoint_consistency_ok" != "true" ]; then
+                apply_mechanism_failed=true
+                reason="candidate_endpoint_not_applied"
+                break
+            fi
+
+            if "$IP_BIN" link show "$iface" >/dev/null 2>&1 \
                 && "$IP_BIN" route show table "$table" 2>/dev/null | grep -Eq "default[[:space:]].*dev[[:space:]]+${iface}([[:space:]]|$)" \
                 && strict_ping "$iface" "$health_targets" "$strict_count" "$strict_timeout"; then
                 decision="commit_ok"
-                reason="candidate_applied_and_strict_ok"
+                reason="candidate_applied_live_verified_and_strict_ok"
                 post_strict_ok=true
                 break
             fi
 
-            reg_quarantine_endpoint "$candidate" "$SLOT" "$iface" "" "repair_candidate_failed" "$selected_pool" "STEP_050M07R15A_LEGACY_EXECUTION_FREEZE_AND_CLEAN_FOUNDATION" >/dev/null 2>&1 || true
+            reg_quarantine_endpoint "$candidate" "$SLOT" "$iface" "" "repair_candidate_failed" "$selected_pool" "STEP_050M07R20J_LIVE_PEER_ENDPOINT_APPLY" >/dev/null 2>&1 || true
         done <"$candidate_file"
 
         if [ "$decision" != "commit_ok" ]; then
@@ -437,12 +478,16 @@ EOF
                     "$SLOTS_APPLY" start "$SLOT" >/dev/null 2>&1 || true
                 fi
                 restored="$(current_endpoint_for_iface "$iface")"
-                if [ "$restored" = "$current_ep" ]; then
+                restored_peer="$(peer_uci_endpoint_for_iface "$iface")"
+                restored_live="$(live_endpoint_for_iface "$iface")"
+                if [ "$restored" = "$current_ep" ] && [ "$restored_peer" = "$current_ep" ] && [ "$restored_live" = "$current_ep" ]; then
                     rollback_ok=true
                 fi
             fi
             decision="commit_failed"
-            if [ "$rollback_ok" = "true" ]; then
+            if [ "$apply_mechanism_failed" = "true" ]; then
+                if [ "$rollback_ok" = "true" ]; then reason="candidate_endpoint_not_applied_original_restored"; else reason="candidate_endpoint_not_applied_original_restore_failed"; fi
+            elif [ "$rollback_ok" = "true" ]; then
                 reason="all_candidates_failed_original_restored"
             else
                 reason="all_candidates_failed_original_restore_failed"
