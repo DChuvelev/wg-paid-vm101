@@ -1,155 +1,58 @@
 #!/bin/sh
-# STEP_050M07R15A_LEGACY_EXECUTION_FREEZE_AND_CLEAN_FOUNDATION
 set -u
+export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
+CORE="${ROUTER_EGRESS_RECOVERY_DISPATCHER_CORE:-/usr/local/lib/router-egress-recovery-dispatcher-core.sh}"
+SYNC="${ROUTER_WGPAY_WATCHER_SYNC:-/usr/local/sbin/router-wgpay-watcher-topology-sync.sh}"
+LOG="${ROUTER_WGPAY_WATCHER_LOG:-/var/log/router-wgpay-health-topology.log}"
 
-ADAPTER="${ADAPTER:-/usr/local/sbin/router-egress-recovery-hmn-pool-replace.sh}"
-MODE="--dry-run"
-SLOT=""
-REASON="health_fail"
-CONFIRM=""
+[ -x "$CORE" ] || { echo RESULT=STOP_WATCHER_DISPATCHER_CORE_MISSING; exit 70; }
 
-while [ "$#" -gt 0 ]; do
-    case "$1" in
-        --slot)
-            [ "$#" -ge 2 ] || { echo 'ERROR=slot_value_missing' >&2; exit 2; }
-            SLOT="$2"
-            shift 2
-            ;;
-        --reason)
-            [ "$#" -ge 2 ] || { echo 'ERROR=reason_value_missing' >&2; exit 2; }
-            REASON="$2"
-            shift 2
-            ;;
-        --dry-run|--dryrun)
-            MODE="--dry-run"
-            shift
-            ;;
-        --commit|--apply)
-            MODE="--commit"
-            shift
-            ;;
-        --confirm)
-            [ "$#" -ge 2 ] || { echo 'ERROR=confirm_value_missing' >&2; exit 2; }
-            CONFIRM="$2"
-            shift 2
-            ;;
-        *)
-            echo "ERROR=unsupported_argument:$1" >&2
-            exit 2
-            ;;
-    esac
-done
-
-json_escape() {
-    printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'
-}
-
-emit_json() {
-    echo '{'
-    echo '  "schema": "router-egress-recovery-dispatcher-v2",'
-    echo "  \"mode\": \"$(json_escape "$MODE")\","
-    echo "  \"slot\": \"$(json_escape "$SLOT")\","
-    echo "  \"reason_input\": \"$(json_escape "$REASON")\","
-    echo "  \"iface\": \"$(json_escape "$iface")\","
-    echo "  \"candidate_endpoint\": \"$(json_escape "$candidate")\","
-    echo "  \"adapter_dryrun_rc\": ${dry_rc},"
-    echo "  \"adapter_dryrun_decision\": \"$(json_escape "$dry_decision")\","
-    echo "  \"adapter_dryrun_reason\": \"$(json_escape "$dry_reason")\","
-    echo "  \"adapter_selected_pool\": \"$(json_escape "$adapter_selected_pool")\","
-    echo "  \"adapter_selected_pool_age_sec\": ${adapter_selected_pool_age_sec},"
-    echo "  \"adapter_available_candidate_count\": ${adapter_available_candidate_count},"
-    echo "  \"adapter_commit_rc\": ${commit_rc},"
-    echo "  \"adapter_commit_decision\": \"$(json_escape "$commit_decision")\","
-    echo "  \"adapter_commit_reason\": \"$(json_escape "$commit_reason")\","
-    echo "  \"decision\": \"$(json_escape "$decision")\","
-    echo "  \"reason\": \"$(json_escape "$reason_out")\","
-    echo "  \"apply_performed\": ${apply_performed},"
-    echo "  \"required_dispatch_confirm\": \"$(json_escape "$required_confirm")\","
-    echo '  "safety": {'
-    echo '    "slot_is_required": true,'
-    echo '    "dry_run_no_uci_set": true,'
-    echo '    "dry_run_no_ifup_ifdown": true,'
-    echo '    "commit_requires_dispatch_confirm": true,'
-    echo '    "adapter_nonzero_rc_cannot_be_commit_ok": true'
-    echo '  }'
-    echo '}'
-}
-
-iface=""
-candidate=""
-dry_rc=2
-dry_decision=""
-dry_reason=""
-adapter_selected_pool=""
-adapter_selected_pool_age_sec=0
-adapter_available_candidate_count=0
-commit_rc=0
-commit_decision=""
-commit_reason=""
-decision="refuse"
-reason_out="unknown"
-apply_performed=false
-required_confirm=""
-
-if [ -z "$SLOT" ]; then
-    reason_out="slot_required"
-    emit_json
-    exit 2
-fi
-
-if [ ! -x "$ADAPTER" ]; then
-    reason_out="adapter_missing"
-    emit_json
-    exit 2
-fi
-
-dry_json="$($ADAPTER --dry-run --slot "$SLOT" 2>/dev/null)"
-dry_rc=$?
-candidate="$(printf '%s\n' "$dry_json" | sed -n 's/.*"candidate_endpoint": "\([^"]*\)".*/\1/p' | head -n 1)"
-iface="$(printf '%s\n' "$dry_json" | sed -n 's/.*"interface": "\([^"]*\)".*/\1/p' | head -n 1)"
-dry_decision="$(printf '%s\n' "$dry_json" | sed -n 's/.*"decision": "\([^"]*\)".*/\1/p' | head -n 1)"
-dry_reason="$(printf '%s\n' "$dry_json" | sed -n 's/.*"reason": "\([^"]*\)".*/\1/p' | head -n 1)"
-adapter_selected_pool="$(printf '%s\n' "$dry_json" | sed -n 's/.*"selected_pool": "\([^"]*\)".*/\1/p' | head -n 1)"
-adapter_selected_pool_age_sec="$(printf '%s\n' "$dry_json" | sed -n 's/.*"selected_pool_age_sec": \([0-9][0-9]*\).*/\1/p' | head -n 1)"
-adapter_available_candidate_count="$(printf '%s\n' "$dry_json" | sed -n 's/.*"available_candidate_count": \([0-9][0-9]*\).*/\1/p' | head -n 1)"
-case "$adapter_selected_pool_age_sec" in ''|*[!0-9]*) adapter_selected_pool_age_sec=0 ;; esac
-case "$adapter_available_candidate_count" in ''|*[!0-9]*) adapter_available_candidate_count=0 ;; esac
-required_confirm="DISPATCH_${SLOT}_${candidate}"
-
-if [ "$dry_rc" -ne 0 ] || [ "$dry_decision" != "dry_run_ok" ] || [ -z "$candidate" ] || [ -z "$iface" ]; then
-    decision="refuse"
-    reason_out="adapter_dryrun_not_ready_${dry_reason:-unknown}"
-elif [ "$MODE" = "--dry-run" ]; then
-    decision="dry_run_ok"
-    reason_out="dispatcher_ready"
-elif [ "$MODE" = "--commit" ]; then
-    if [ "$CONFIRM" != "$required_confirm" ]; then
-        decision="refuse"
-        reason_out="missing_or_wrong_dispatch_confirm"
-    else
-        adapter_confirm="APPLY_${SLOT}_${iface}_${candidate}"
-        commit_json="$($ADAPTER --commit --slot "$SLOT" --confirm "$adapter_confirm" 2>/dev/null)"
-        commit_rc=$?
-        commit_decision="$(printf '%s\n' "$commit_json" | sed -n 's/.*"decision": "\([^"]*\)".*/\1/p' | head -n 1)"
-        commit_reason="$(printf '%s\n' "$commit_json" | sed -n 's/.*"reason": "\([^"]*\)".*/\1/p' | head -n 1)"
-        apply_performed=true
-        if [ "$commit_rc" -eq 0 ] && [ "$commit_decision" = "commit_ok" ]; then
-            decision="commit_ok"
-            reason_out="adapter_commit_ok"
-        else
-            decision="commit_failed"
-            reason_out="adapter_commit_failed_or_state_record_failed"
-        fi
+find_slot() {
+    for value in \
+        "${ROUTER_EGRESS_FAILED_SLOT:-}" \
+        "${ROUTER_EGRESS_TARGET_SLOT:-}" \
+        "${FAILED_SLOT:-}" "${TARGET_SLOT:-}" "${SLOT:-}" \
+        "$@"
+    do
+        case "$value" in
+            egress[1-5]) printf '%s\n' "$value"; return 0 ;;
+            vpn[1-5]) printf 'egress%s\n' "${value#vpn}"; return 0 ;;
+            *=egress[1-5]) printf '%s\n' "${value##*=}"; return 0 ;;
+            *=vpn[1-5]) printf 'egress%s\n' "${value##*vpn}"; return 0 ;;
+            *egress[1-5]*)
+                printf '%s\n' "$value" | sed -n 's/.*\(egress[1-5]\).*/\1/p' | head -n1
+                return 0
+                ;;
+        esac
+    done
+    state="${ROUTER_EGRESS_RECOVERY_STATE_FILE:-/var/lib/router-egress-recovery/state.kv}"
+    if [ -f "$state" ]; then
+        for key in failed_slot target_slot slot egress_slot; do
+            value="$(awk -F= -v k="$key" '$1==k{print substr($0,index($0,"=")+1)}' "$state" | tail -n1)"
+            case "$value" in egress[1-5]) printf '%s\n' "$value"; return 0;; esac
+        done
     fi
-else
-    decision="refuse"
-    reason_out="unsupported_mode"
+    return 1
+}
+
+log_line() {
+    mkdir -p "$(dirname "$LOG")" 2>/dev/null || true
+    printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$LOG" 2>/dev/null || true
+}
+
+slot="$(find_slot "$@" 2>/dev/null || true)"
+if [ -n "$slot" ] && [ -x "$SYNC" ]; then
+    "$SYNC" --bridge-start "$slot" watcher_dispatch_start >> "$LOG" 2>&1 || log_line "bridge_start_failed slot=$slot rc=$?"
 fi
 
-emit_json
+"$CORE" "$@"
+rc=$?
 
-case "$decision" in
-    dry_run_ok|commit_ok) exit 0 ;;
-    commit_failed) exit 3 ;;
-    *) exit 2 ;;
-esac
+if [ -n "$slot" ] && [ -x "$SYNC" ]; then
+    if [ "$rc" -eq 0 ]; then
+        "$SYNC" --bridge-clear "$slot" watcher_dispatch_success >> "$LOG" 2>&1 || log_line "bridge_clear_failed slot=$slot rc=$?"
+    else
+        "$SYNC" --bridge-confirm "$slot" watcher_dispatch_failed >> "$LOG" 2>&1 || log_line "bridge_confirm_failed slot=$slot rc=$?"
+    fi
+fi
+exit "$rc"
