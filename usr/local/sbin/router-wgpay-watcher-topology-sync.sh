@@ -12,6 +12,7 @@ STATE_FILE="${ROUTER_WGPAY_WATCHER_STATE_FILE:-$WATCHER_TOPOLOGY_STATE_FILE}"
 LOCK_FILE="${ROUTER_WGPAY_WATCHER_LOCK_FILE:-$WATCHER_TOPOLOGY_LOCK_FILE}"
 FALLBACK_STATE="${ROUTER_WGPAY_WATCHER_FALLBACK_STATE:-$WATCHER_TOPOLOGY_FALLBACK_STATE}"
 FALLBACK_ACK="${ROUTER_WGPAY_WATCHER_FALLBACK_ACK:-$WATCHER_TOPOLOGY_FALLBACK_ACK}"
+DIRECT_STATE="${ROUTER_WGPAY_WATCHER_DIRECT_STATE:-${WATCHER_TOPOLOGY_DIRECT_STATE_FILE:-/etc/router-wgpay-direct/state.kv}}"
 MAPPER_APPLY="${ROUTER_WGPAY_WATCHER_MAPPER_APPLY:-$WATCHER_TOPOLOGY_MAPPER_APPLY}"
 OUTBOX="${ROUTER_WGPAY_WATCHER_OUTBOX:-$WATCHER_TOPOLOGY_OUTBOX}"
 NFT_BIN="${ROUTER_WGPAY_WATCHER_NFT_BIN:-nft}"
@@ -30,7 +31,7 @@ case "$mode" in
 esac
 case "$slot" in egress[1-5]) ;; *) echo RESULT=STOP_WATCHER_TOPOLOGY_SLOT_INVALID; exit 64;; esac
 
-mkdir -p "$STATE_DIR" "$(dirname "$LOCK_FILE")" "$(dirname "$FALLBACK_LOCK_FILE")" "$(dirname "$OUTBOX_LOCK_FILE")" || exit 70
+mkdir -p "$STATE_DIR" "$(dirname "$DIRECT_STATE")" "$(dirname "$LOCK_FILE")" "$(dirname "$FALLBACK_LOCK_FILE")" "$(dirname "$OUTBOX_LOCK_FILE")" || exit 70
 chmod 700 "$STATE_DIR" 2>/dev/null || true
 exec 9>"$LOCK_FILE"
 flock -n 9 || { echo RESULT=NOOP_WATCHER_TOPOLOGY_LOCKED; exit 75; }
@@ -51,6 +52,7 @@ gen_next() { printf '%s' "$1" | grep -Eq '^[0-9]{12}$' || return 1; [ "$1" != 99
 atomic_write() { src="$1" dst="$2" mode_bits="${3:-600}"; mkdir -p "$(dirname "$dst")" || return 1; cp "$src" "$dst.tmp.$$" && chmod "$mode_bits" "$dst.tmp.$$" && mv "$dst.tmp.$$" "$dst"; }
 
 old_exhausted="$(kv exhausted_slots "$STATE_FILE")"
+[ -n "$old_exhausted" ] || old_exhausted="$(kv exhausted_slots "$DIRECT_STATE")"
 [ -n "$old_exhausted" ] || old_exhausted="$(kv exhausted_slots "$FALLBACK_STATE")"
 new_exhausted=''
 for s in egress1 egress2 egress3 egress4 egress5; do
@@ -73,7 +75,68 @@ healthy_slots=''
 for s in egress1 egress2 egress3 egress4 egress5; do
     csv_has "$new_exhausted" "$s" || healthy_slots="${healthy_slots:+$healthy_slots,}$s"
 done
-[ -n "$healthy_slots" ] || { echo RESULT=STOP_WATCHER_TOPOLOGY_ZERO_HEALTHY_DIRECT_REQUIRED; exit 73; }
+if [ -z "$healthy_slots" ]; then
+    exhausted_selectors='cs1,cs2,cs3,cs4,cs5'
+    old_fallback_gen="$(kv accepted_generation "$FALLBACK_STATE")"; [ -n "$old_fallback_gen" ] || old_fallback_gen=000000000000
+    old_direct_gen="$(kv accepted_generation "$DIRECT_STATE")"; [ -n "$old_direct_gen" ] || old_direct_gen=000000000000
+    printf '%s' "$old_fallback_gen" | grep -Eq '^[0-9]{12}$' || { echo RESULT=STOP_WATCHER_TOPOLOGY_GENERATION_INVALID; exit 70; }
+    printf '%s' "$old_direct_gen" | grep -Eq '^[0-9]{12}$' || { echo RESULT=STOP_WATCHER_TOPOLOGY_GENERATION_INVALID; exit 70; }
+    if awk -v a="$old_direct_gen" -v b="$old_fallback_gen" 'BEGIN{exit !(a+0>b+0)}'; then old_gen="$old_direct_gen"; else old_gen="$old_fallback_gen"; fi
+    new_gen="$(gen_next "$old_gen")" || { echo RESULT=STOP_WATCHER_TOPOLOGY_GENERATION_INVALID; exit 70; }
+    action_safe="$(printf '%s' "${mode#--}" | tr '-' '_')"
+    source_gen="WATCHER_${action_safe}_${slot}_${NOW}"
+    TMP="$STATE_DIR/direct-txn.$$"; rm -rf "$TMP"; mkdir -p "$TMP" || exit 70
+    trap 'rm -rf "$TMP"' EXIT HUP INT TERM
+    body="$TMP/direct.body"; candidate="$TMP/direct.candidate"
+    {
+        echo schema=router-wgpay-fallback-state-v1
+        echo accepted_generation="$new_gen"
+        echo mode=SLOT_EXHAUSTED
+        echo source_vm101_generation="$source_gen"
+        echo healthy_slots=
+        echo exhausted_slots=egress1,egress2,egress3,egress4,egress5
+        echo healthy_selectors=
+        echo exhausted_selectors="$exhausted_selectors"
+        echo first_healthy_slot=
+        echo created_epoch="$NOW"
+        echo applied_epoch="$NOW"
+        echo fallback_selectors="$exhausted_selectors"
+        echo direct_required=true
+        echo mapper_applied=false
+    } > "$body" || exit 70
+    payload="$(sha256sum "$body" | awk '{print $1}')"
+    { sed -n '1p' "$body"; echo payload_sha256="$payload"; sed -n '2,$p' "$body"; } > "$candidate"
+    atomic_write "$candidate" "$DIRECT_STATE" 600 || { echo RESULT=STOP_WATCHER_TOPOLOGY_DIRECT_STATE_WRITE; exit 70; }
+    integration="$TMP/integration"
+    {
+        echo schema="$WATCHER_TOPOLOGY_SCHEMA"
+        echo updated_epoch="$NOW"
+        echo last_action="${mode#--}"
+        echo last_slot="$slot"
+        echo last_reason="$reason"
+        echo fallback_generation="$new_gen"
+        echo mode=SLOT_EXHAUSTED
+        echo healthy_slots=
+        echo exhausted_slots=egress1,egress2,egress3,egress4,egress5
+        echo healthy_selectors=
+        echo exhausted_selectors="$exhausted_selectors"
+        echo first_healthy_slot=
+        echo direct_required=true
+    } > "$integration"
+    atomic_write "$integration" "$STATE_FILE" 600 || { rm -f "$DIRECT_STATE"; echo RESULT=STOP_WATCHER_TOPOLOGY_INTEGRATION_STATE_WRITE; exit 82; }
+    exec 8>&-
+    outbox_rc=0
+    if [ -x "$OUTBOX" ]; then "$OUTBOX" --sync > "$TMP/outbox.log" 2>&1 || outbox_rc=$?; fi
+    cat "$TMP/outbox.log" 2>/dev/null || true
+    echo RESULT=PASS_WATCHER_TOPOLOGY_DIRECT_REQUIRED
+    echo ACTION="${mode#--}"
+    echo SLOT="$slot"
+    echo DIRECT_GENERATION="$new_gen"
+    echo EXHAUSTED_SLOTS=egress1,egress2,egress3,egress4,egress5
+    echo MAPPER_APPLIED=false
+    echo OUTBOX_RC="$outbox_rc"
+    exit 0
+fi
 first_healthy="${healthy_slots%%,*}"
 exhausted_selectors=''
 healthy_selectors=''
@@ -88,13 +151,15 @@ done
 if [ -z "$new_exhausted" ]; then state_mode=NORMAL; else state_mode=SLOT_EXHAUSTED; fi
 old_gen="$(kv accepted_generation "$FALLBACK_STATE")"; [ -n "$old_gen" ] || old_gen=000000000000
 new_gen="$(gen_next "$old_gen")" || { echo RESULT=STOP_WATCHER_TOPOLOGY_GENERATION_INVALID; exit 70; }
-source_gen="WATCHER_${mode#--}_${slot}_${NOW}"
+action_safe="$(printf '%s' "${mode#--}" | tr '-' '_')"
+source_gen="WATCHER_${action_safe}_${slot}_${NOW}"
 
 TMP="$STATE_DIR/txn.$$"; rm -rf "$TMP"; mkdir -p "$TMP" || exit 70
 trap 'rm -rf "$TMP"' EXIT HUP INT TERM
-old_state_present=false; old_ack_present=false
+old_state_present=false; old_ack_present=false; old_direct_present=false
 if [ -f "$FALLBACK_STATE" ]; then cp "$FALLBACK_STATE" "$TMP/state.before" || exit 70; old_state_present=true; fi
 if [ -f "$FALLBACK_ACK" ]; then cp "$FALLBACK_ACK" "$TMP/ack.before" || exit 70; old_ack_present=true; fi
+if [ -f "$DIRECT_STATE" ]; then cp "$DIRECT_STATE" "$TMP/direct.before" || exit 70; old_direct_present=true; fi
 
 body="$TMP/state.body"; candidate="$TMP/state.candidate"
 {
@@ -130,6 +195,7 @@ payload="$(sha256sum "$body" | awk '{print $1}')"
 rollback() {
     if [ "$old_state_present" = true ]; then atomic_write "$TMP/state.before" "$FALLBACK_STATE" 600 || true; else rm -f "$FALLBACK_STATE"; fi
     if [ "$old_ack_present" = true ]; then atomic_write "$TMP/ack.before" "$FALLBACK_ACK" 600 || true; else rm -f "$FALLBACK_ACK"; fi
+    if [ "$old_direct_present" = true ]; then atomic_write "$TMP/direct.before" "$DIRECT_STATE" 600 || true; else rm -f "$DIRECT_STATE"; fi
     ROUTER_WGPAY_FALLBACK_LOCK_BYPASS=1 "$MAPPER_APPLY" start >/dev/null 2>&1 || true
 }
 
@@ -187,6 +253,7 @@ integration="$TMP/integration"
     echo first_healthy_slot="$first_healthy"
 } > "$integration"
 atomic_write "$integration" "$STATE_FILE" 600 || { rollback; echo RESULT=STOP_WATCHER_TOPOLOGY_INTEGRATION_STATE_WRITE; exit 82; }
+if [ -f "$DIRECT_STATE" ]; then rm -f "$DIRECT_STATE" || { rollback; echo RESULT=STOP_WATCHER_TOPOLOGY_DIRECT_STATE_CLEAR; exit 82; }; fi
 
 # Local mapper/state/ack are committed. Release delivery lock, then create/supersede pending;
 # the already-running retry service performs SSH delivery independently.

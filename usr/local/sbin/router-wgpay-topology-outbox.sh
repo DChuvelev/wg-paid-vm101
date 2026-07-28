@@ -11,6 +11,8 @@ LIB="${ROUTER_TOPOLOGY_DELIVERY_LIB:-/usr/local/lib/router-wgpay-topology-delive
 . "$LIB"
 
 FALLBACK_STATE="${ROUTER_TOPOLOGY_DELIVERY_FALLBACK_STATE:-${TOPOLOGY_DELIVERY_FALLBACK_STATE}}"
+DIRECT_STATE="${ROUTER_TOPOLOGY_DELIVERY_DIRECT_STATE:-${TOPOLOGY_DELIVERY_DIRECT_STATE:-/etc/router-wgpay-direct/state.kv}}"
+SOURCE_STATE="$FALLBACK_STATE"
 STATE_DIR="${ROUTER_TOPOLOGY_DELIVERY_STATE_DIR:-${TOPOLOGY_DELIVERY_STATE_DIR}}"
 LOCK_FILE="${ROUTER_TOPOLOGY_DELIVERY_LOCK:-${TOPOLOGY_DELIVERY_LOCK}}"
 DELIVERY_COMMAND="${ROUTER_TOPOLOGY_DELIVERY_COMMAND:-${TOPOLOGY_DELIVERY_COMMAND}}"
@@ -71,15 +73,21 @@ state_update() {
     rm -f "$updates" "$candidate"
 }
 
+source_snapshot_select() {
+    SOURCE_STATE="$FALLBACK_STATE"
+    if [ -f "$DIRECT_STATE" ] && [ "$(router_topology_delivery_kv_get direct_required "$DIRECT_STATE")" = true ]; then SOURCE_STATE="$DIRECT_STATE"; fi
+}
+
 fallback_snapshot_validate() {
-    [ -f "$FALLBACK_STATE" ] || return 10
-    fb_schema="$(router_topology_delivery_kv_get schema "$FALLBACK_STATE")"
-    fb_mode="$(router_topology_delivery_kv_get mode "$FALLBACK_STATE")"
-    fb_source="$(router_topology_delivery_kv_get source_vm101_generation "$FALLBACK_STATE")"
-    fb_healthy_slots="$(router_topology_delivery_kv_get healthy_slots "$FALLBACK_STATE")"
-    fb_exhausted_slots="$(router_topology_delivery_kv_get exhausted_slots "$FALLBACK_STATE")"
-    fb_healthy_selectors="$(router_topology_delivery_kv_get healthy_selectors "$FALLBACK_STATE")"
-    fb_exhausted_selectors="$(router_topology_delivery_kv_get exhausted_selectors "$FALLBACK_STATE")"
+    source_snapshot_select
+    [ -f "$SOURCE_STATE" ] || return 10
+    fb_schema="$(router_topology_delivery_kv_get schema "$SOURCE_STATE")"
+    fb_mode="$(router_topology_delivery_kv_get mode "$SOURCE_STATE")"
+    fb_source="$(router_topology_delivery_kv_get source_vm101_generation "$SOURCE_STATE")"
+    fb_healthy_slots="$(router_topology_delivery_kv_get healthy_slots "$SOURCE_STATE")"
+    fb_exhausted_slots="$(router_topology_delivery_kv_get exhausted_slots "$SOURCE_STATE")"
+    fb_healthy_selectors="$(router_topology_delivery_kv_get healthy_selectors "$SOURCE_STATE")"
+    fb_exhausted_selectors="$(router_topology_delivery_kv_get exhausted_selectors "$SOURCE_STATE")"
     [ "$fb_schema" = router-wgpay-fallback-state-v1 ] || return 11
     case "$fb_mode" in NORMAL|SLOT_EXHAUSTED) ;; *) return 12 ;; esac
     printf '%s' "$fb_source" | grep -Eq '^[A-Za-z0-9_.:-]{1,128}$' || return 13
@@ -249,6 +257,9 @@ status_emit() {
     echo delivery_enabled="$DELIVERY_ENABLED"
     echo state_dir="$STATE_DIR"
     echo transport_command="$DELIVERY_COMMAND"
+    source_snapshot_select
+    echo source_state="$SOURCE_STATE"
+    echo direct_state_present="$([ -f "$DIRECT_STATE" ] && echo true || echo false)"
     if [ -f "$STATE_FILE" ]; then cat "$STATE_FILE"; else echo state_initialized=false; fi
     if [ -f "$PENDING_FILE" ]; then
         echo pending_present=true
