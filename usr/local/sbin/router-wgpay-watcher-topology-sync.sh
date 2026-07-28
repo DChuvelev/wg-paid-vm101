@@ -130,12 +130,12 @@ payload="$(sha256sum "$body" | awk '{print $1}')"
 rollback() {
     if [ "$old_state_present" = true ]; then atomic_write "$TMP/state.before" "$FALLBACK_STATE" 600 || true; else rm -f "$FALLBACK_STATE"; fi
     if [ "$old_ack_present" = true ]; then atomic_write "$TMP/ack.before" "$FALLBACK_ACK" 600 || true; else rm -f "$FALLBACK_ACK"; fi
-    "$MAPPER_APPLY" start >/dev/null 2>&1 || true
+    ROUTER_WGPAY_FALLBACK_LOCK_BYPASS=1 "$MAPPER_APPLY" start >/dev/null 2>&1 || true
 }
 
 atomic_write "$candidate" "$FALLBACK_STATE" 600 || { echo RESULT=STOP_WATCHER_TOPOLOGY_STATE_WRITE; exit 70; }
 set +e
-"$MAPPER_APPLY" start > "$TMP/mapper.log" 2>&1
+ROUTER_WGPAY_FALLBACK_LOCK_BYPASS=1 "$MAPPER_APPLY" start > "$TMP/mapper.log" 2>&1
 mapper_rc=$?
 set -e
 if [ "$mapper_rc" -ne 0 ]; then
