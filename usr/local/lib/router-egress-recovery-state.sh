@@ -410,3 +410,98 @@ reg_selftest() {
     rm -rf "$reg_test_root"
     echo selftest.ok=true
 }
+
+# Idempotent full-pool refresh request. This function mutates only the durable
+# recovery state; it never executes the heavy refresh itself.
+# stdout: REQUESTED | NOOP_ALREADY_PENDING | NOOP_ALREADY_RUNNING |
+#         NOOP_RETRY_ACTIVE | ERROR_*
+reg_request_full_refresh() {
+    reg_req_reason="$(reg_clean_tsv "${1:-unspecified}")"
+    reg_req_slot="$(reg_clean_tsv "${2:-}")"
+    [ -n "$reg_req_reason" ] || reg_req_reason=unspecified
+
+    reg_req_lock="$(reg_state_write_lock_acquire 2>/dev/null || true)"
+    if [ -z "$reg_req_lock" ]; then
+        echo ERROR_STATE_LOCK
+        return 1
+    fi
+    if ! reg_init_state_unlocked; then
+        reg_state_write_lock_release "$reg_req_lock" >/dev/null 2>&1 || true
+        echo ERROR_STATE_INIT
+        return 1
+    fi
+
+    reg_req_mode="$(grep '^mode=' "$REG_STATE_KV" 2>/dev/null | tail -n1 | sed 's/^[^=]*=//')"
+    case "$reg_req_mode" in
+        FULL_POOL_REFRESH_PENDING)
+            reg_state_write_lock_release "$reg_req_lock" >/dev/null 2>&1 || true
+            echo NOOP_ALREADY_PENDING
+            return 0
+            ;;
+        FULL_POOL_REFRESH_RUNNING)
+            reg_state_write_lock_release "$reg_req_lock" >/dev/null 2>&1 || true
+            echo NOOP_ALREADY_RUNNING
+            return 0
+            ;;
+        DEGRADED_POOL|DEGRADED_POOL_PENDING)
+            # Preserve the existing durable retry schedule exactly.
+            reg_state_write_lock_release "$reg_req_lock" >/dev/null 2>&1 || true
+            echo NOOP_RETRY_ACTIVE
+            return 0
+            ;;
+        NORMAL|LOCAL_REPAIR_READY)
+            ;;
+        *)
+            reg_state_write_lock_release "$reg_req_lock" >/dev/null 2>&1 || true
+            echo ERROR_UNSUPPORTED_MODE
+            return 1
+            ;;
+    esac
+
+    reg_req_now="$(reg_now_epoch)"
+    case "$reg_req_now" in ''|*[!0-9]*)
+        reg_state_write_lock_release "$reg_req_lock" >/dev/null 2>&1 || true
+        echo ERROR_CLOCK
+        return 1
+        ;;
+    esac
+    reg_req_updates="/tmp/router-egress-refresh-request-updates.$$"
+    reg_req_candidate="/tmp/router-egress-refresh-request-candidate.$$"
+    {
+        printf 'mode=FULL_POOL_REFRESH_PENDING\n'
+        printf 'full_refresh_due=true\n'
+        printf 'full_refresh_request_reason=%s\n' "$reg_req_reason"
+        printf 'full_refresh_request_slot=%s\n' "$reg_req_slot"
+        printf 'full_refresh_request_epoch=%s\n' "$reg_req_now"
+    } >"$reg_req_updates" || {
+        rm -f "$reg_req_updates" "$reg_req_candidate"
+        reg_state_write_lock_release "$reg_req_lock" >/dev/null 2>&1 || true
+        echo ERROR_REQUEST_BUILD
+        return 1
+    }
+    awk -F= '
+        NR==FNR { update[$1]=$0; has[$1]=1; next }
+        {
+            key=$1
+            if (has[key]) { print update[key]; emitted[key]=1 } else print
+        }
+        END { for (key in update) if (!emitted[key]) print update[key] }
+    ' "$reg_req_updates" "$REG_STATE_KV" >"$reg_req_candidate" || {
+        rm -f "$reg_req_updates" "$reg_req_candidate"
+        reg_state_write_lock_release "$reg_req_lock" >/dev/null 2>&1 || true
+        echo ERROR_REQUEST_MERGE
+        return 1
+    }
+    if ! reg_state_commit_candidate "$reg_req_candidate"; then
+        rm -f "$reg_req_updates" "$reg_req_candidate"
+        reg_state_write_lock_release "$reg_req_lock" >/dev/null 2>&1 || true
+        echo ERROR_STATE_COMMIT
+        return 1
+    fi
+    rm -f "$reg_req_updates" "$reg_req_candidate"
+    reg_state_write_lock_release "$reg_req_lock" >/dev/null 2>&1 || true
+    REG_STATE_INITIALIZED=1
+    echo REQUESTED
+    return 0
+}
+

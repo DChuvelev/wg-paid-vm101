@@ -1,5 +1,6 @@
 #!/bin/sh
 # Canonical VM101 LOCAL_REPAIR watcher. BusyBox ash compatible.
+# R20Q-K: no-candidate failures request one durable full-pool refresh.
 set -u
 
 VM101_CONF="${VM101_CONF:-/etc/router-egress-vm101.conf}"
@@ -37,6 +38,7 @@ case "$MODE" in --dry-run|--commit) ;; *) echo "ERROR=invalid_mode:$MODE" >&2; e
 case "$FAIL_THRESHOLD:$INTERVAL_SEC:$COOLDOWN_SEC" in *[!0-9:]*) echo 'ERROR=invalid_numeric_configuration' >&2; exit 2 ;; esac
 [ -r "$SLOTS_CONF" ] || { echo "ERROR=slots_conf_missing:$SLOTS_CONF" >&2; exit 2; }
 [ -x "$DISPATCHER" ] || { echo "ERROR=dispatcher_missing:$DISPATCHER" >&2; exit 2; }
+[ -r "$STATE_HELPER" ] || { echo "ERROR=state_helper_missing:$STATE_HELPER" >&2; exit 2; }
 mkdir -p "$WATCH_STATE_DIR" "$(dirname "$LOG")" || exit 2
 
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -90,6 +92,8 @@ run_once() {
         adapter_selected_pool_age_sec=0
         adapter_available_candidate_count=0
         candidate_endpoint=""
+        refresh_request_reason=""
+        refresh_request_result=not_requested
 
         if slot_ok "$iface" "$targets" "$strict_count" "$strict_timeout"; then
             health_ok=true
@@ -148,6 +152,24 @@ run_once() {
                     decision="$dry_decision"
                     [ -n "$decision" ] || decision=dry_run_failed_no_decision
                     action=dry_run_dispatch
+                    if [ "$MODE" = --commit ]; then
+                        case "$adapter_reason" in
+                            no_pool_file|stale_pool|no_eligible_candidate_with_config)
+                                refresh_request_reason="$adapter_reason"
+                                # shellcheck disable=SC1090
+                                . "$STATE_HELPER"
+                                refresh_request_result="$(reg_request_full_refresh "$adapter_reason" "$slot" 2>/dev/null)"
+                                refresh_request_rc=$?
+                                if [ "$refresh_request_rc" -eq 0 ]; then
+                                    action=request_full_refresh
+                                    any_action=true
+                                else
+                                    [ -n "$refresh_request_result" ] || refresh_request_result=ERROR_UNKNOWN
+                                    action=request_full_refresh_failed
+                                fi
+                                ;;
+                        esac
+                    fi
                 fi
                 rm -f "$dry_out"
             fi
@@ -155,19 +177,22 @@ run_once() {
 
         $first || printf ',\n' >>"$json"
         first=false
-        printf '    {"slot":"%s","iface":"%s","health_ok":%s,"fail_count":%s,"decision":"%s","action":"%s","dispatcher_rc":%s,"required_confirm":"%s","adapter_reason":"%s","adapter_selected_pool":"%s","adapter_selected_pool_age_sec":%s,"adapter_available_candidate_count":%s,"candidate_endpoint":"%s"}' \
+        printf '    {"slot":"%s","iface":"%s","health_ok":%s,"fail_count":%s,"decision":"%s","action":"%s","dispatcher_rc":%s,"required_confirm":"%s","adapter_reason":"%s","adapter_selected_pool":"%s","adapter_selected_pool_age_sec":%s,"adapter_available_candidate_count":%s,"candidate_endpoint":"%s","refresh_request_reason":"%s","refresh_request_result":"%s"}' \
             "$(json_escape "$slot")" "$(json_escape "$iface")" "$health_ok" "$fail_count" \
             "$(json_escape "$decision")" "$(json_escape "$action")" "$dispatcher_rc" \
             "$(json_escape "$required_confirm")" "$(json_escape "$adapter_reason")" \
             "$(json_escape "$adapter_selected_pool")" "$adapter_selected_pool_age_sec" \
-            "$adapter_available_candidate_count" "$(json_escape "$candidate_endpoint")" >>"$json"
-        printf '%s slot=%s iface=%s health_ok=%s fail_count=%s decision=%s action=%s dispatcher_rc=%s mode=%s adapter_reason=%s pool=%s pool_age_sec=%s candidate_count=%s candidate=%s\n' \
+            "$adapter_available_candidate_count" "$(json_escape "$candidate_endpoint")" \
+            "$(json_escape "$refresh_request_reason")" "$(json_escape "$refresh_request_result")" >>"$json"
+        printf '%s slot=%s iface=%s health_ok=%s fail_count=%s decision=%s action=%s dispatcher_rc=%s mode=%s adapter_reason=%s pool=%s pool_age_sec=%s candidate_count=%s candidate=%s refresh_request_reason=%s refresh_request_result=%s
+' \
             "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$slot" "$iface" "$health_ok" "$fail_count" \
             "$decision" "$action" "$dispatcher_rc" "$MODE" "$adapter_reason" "$adapter_selected_pool" \
-            "$adapter_selected_pool_age_sec" "$adapter_available_candidate_count" "$candidate_endpoint" >>"$LOG"
+            "$adapter_selected_pool_age_sec" "$adapter_available_candidate_count" "$candidate_endpoint" \
+            "$refresh_request_reason" "$refresh_request_result" >>"$LOG"
     done <"$rows"
 
-    printf '{\n  "schema":"router-egress-health-repair-watch-v3",\n  "mode":"%s",\n  "run_mode":"%s",\n  "any_action":%s,\n  "slots":[\n' \
+    printf '{\n  "schema":"router-egress-health-repair-watch-v4",\n  "mode":"%s",\n  "run_mode":"%s",\n  "any_action":%s,\n  "slots":[\n' \
         "$(json_escape "$MODE")" "$RUN_MODE" "$any_action"
     cat "$json"
     printf '\n  ]\n}\n'

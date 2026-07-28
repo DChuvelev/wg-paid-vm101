@@ -1,5 +1,5 @@
 #!/bin/sh
-# STEP_050M07R20F_LONG_RUNNING_REFRESH_CLOCK_HARDENING
+# STEP_050M07R20QK_MINIMAL_IDEMPOTENT_REFRESH_REQUEST_LINKAGE
 set -eu
 umask 077
 
@@ -186,7 +186,10 @@ elif [ "$RUN_MODE" = --retry ]; then
         exit 0
     fi
 else
-    if [ "$MODE" != FULL_POOL_REFRESH_PENDING ] || [ "$DUE" != true ] || [ "$COUNTER" -lt "$FULL_REFRESH_AFTER_REPAIRS" ]; then
+    # FULL_POOL_REFRESH_PENDING + full_refresh_due=true is the complete
+    # idempotent trigger contract. The repair counter is one request source,
+    # not an additional execution gate.
+    if [ "$MODE" != FULL_POOL_REFRESH_PENDING ] || [ "$DUE" != true ]; then
         echo RESULT=NOOP_R18_FULL_POOL_REFRESH_NOT_DUE
         echo "MODE=$MODE"
         echo "COUNTER=$COUNTER"
@@ -214,7 +217,7 @@ ENTRY_MODE="$MODE"
 ENTRY_DEGRADED_SINCE="$(reg_get_state degraded_since_epoch 0 2>/dev/null || echo 0)"
 COUNTER="$(reg_repair_events_get)"
 if [ "$RUN_MODE" = --run-if-due ]; then
-    if [ "$MODE" != FULL_POOL_REFRESH_PENDING ] || [ "$DUE" != true ] || [ "$COUNTER" -lt "$FULL_REFRESH_AFTER_REPAIRS" ]; then
+    if [ "$MODE" != FULL_POOL_REFRESH_PENDING ] || [ "$DUE" != true ]; then
         echo RESULT=NOOP_R20C_FULL_POOL_REFRESH_RECHECK_NOT_DUE
         exit 0
     fi
@@ -408,7 +411,7 @@ PROVIDER_RESTORE_NEEDED=false
 COMPLETION_NOW_EPOCH="$(date +%s)"
 case "$COMPLETION_NOW_EPOCH" in ''|*[!0-9]*) fail STOP_R20F_COMPLETION_CLOCK_INVALID success_state state_update_failure ;; esac
 [ "$COMPLETION_NOW_EPOCH" -ge "$ACTIVATION_NOW_EPOCH" ] || fail STOP_R20F_COMPLETION_CLOCK_BEFORE_ACTIVATION success_state state_update_failure
-reg_state_update mode NORMAL degraded_reason "" degraded_since_epoch 0 failed_attempt_id "" last_refresh_result PASS last_refresh_epoch "$COMPLETION_NOW_EPOCH" next_refresh_epoch 0 active_generation_id "$GEN_ID" healthy_slot_count_at_failure 5 full_refresh_due false last_full_refresh_result PASS last_full_refresh_attempt_id "$ATTEMPT_ID" last_full_refresh_previous_generation "$ACTIVE_ID" last_full_refresh_new_generation "$GEN_ID" || fail STOP_R20C_SUCCESS_STATE_FINALIZATION_FAILED success_state state_update_failure
+reg_state_update mode NORMAL degraded_reason "" degraded_since_epoch 0 failed_attempt_id "" last_refresh_result PASS last_refresh_epoch "$COMPLETION_NOW_EPOCH" next_refresh_epoch 0 active_generation_id "$GEN_ID" healthy_slot_count_at_failure 5 full_refresh_due false full_refresh_request_reason "" full_refresh_request_slot "" full_refresh_request_epoch 0 last_full_refresh_result PASS last_full_refresh_attempt_id "$ATTEMPT_ID" last_full_refresh_previous_generation "$ACTIVE_ID" last_full_refresh_new_generation "$GEN_ID" || fail STOP_R20C_SUCCESS_STATE_FINALIZATION_FAILED success_state state_update_failure
 COMPLETED=true
 reg_event_append full_pool_refresh PASS "$ATTEMPT_ID" "" "" "" "$ACTIVE_ID" "$GEN_ID" success "$COUNTER" 0 "active_generation_replaced=true" >/dev/null 2>&1 || true
 cat >"$RUN_DIR/result.kv" <<EOF
