@@ -9,6 +9,7 @@ STATE_HELPER="${ROUTER_EGRESS_RECOVERY_STATE_HELPER:-/usr/local/lib/router-egres
 BUILDER="${ROUTER_EGRESS_GENERATION_BUILDER:-/usr/local/sbin/router-egress-generation-build}"
 VALIDATOR="${ROUTER_EGRESS_GENERATION_VALIDATOR:-/usr/local/sbin/router-egress-generation-validate}"
 ACTIVATOR="${ROUTER_EGRESS_GENERATION_ACTIVATOR:-/usr/local/sbin/router-egress-generation-activate}"
+TOPOLOGY_RECONCILE="${ROUTER_EGRESS_TOPOLOGY_RECONCILE:-/usr/local/sbin/router-wgpay-topology-reconcile.sh}"
 RUN_MODE=--run-if-due
 CONFIRM=""
 NOW_EPOCH=""
@@ -50,7 +51,7 @@ RUNTIME_HELPER="${ROUTER_EGRESS_VM101_RUNTIME_HELPER:-/usr/local/lib/router-egre
 [ -r "$RUNTIME_HELPER" ] || { echo RESULT=STOP_R20C_RUNTIME_HELPER_MISSING; exit 21; }
 . "$RUNTIME_HELPER"
 
-for x in "$DOWNLOAD" "$TESTER" "$RANKER" "$BUILDER" "$VALIDATOR" "$ACTIVATOR"; do [ -x "$x" ] || { echo RESULT=STOP_R18_EXECUTABLE_MISSING; echo "PATH=$x"; exit 21; }; done
+for x in "$DOWNLOAD" "$TESTER" "$RANKER" "$BUILDER" "$VALIDATOR" "$ACTIVATOR" "$TOPOLOGY_RECONCILE"; do [ -x "$x" ] || { echo RESULT=STOP_R18_EXECUTABLE_MISSING; echo "PATH=$x"; exit 21; }; done
 [ "${GENERATION_ACTIVATION_ALLOWED:-false}" = false ] || { echo RESULT=STOP_R18_AUTOMATIC_ACTIVATION_POLICY_CHANGED; exit 22; }
 case "$FULL_REFRESH_AFTER_REPAIRS" in ''|*[!0-9]*) echo RESULT=STOP_R18_THRESHOLD_INVALID; exit 22 ;; esac
 [ "$FULL_REFRESH_AFTER_REPAIRS" -gt 0 ] || { echo RESULT=STOP_R18_THRESHOLD_INVALID; exit 22; }
@@ -413,7 +414,24 @@ case "$COMPLETION_NOW_EPOCH" in ''|*[!0-9]*) fail STOP_R20F_COMPLETION_CLOCK_INV
 [ "$COMPLETION_NOW_EPOCH" -ge "$ACTIVATION_NOW_EPOCH" ] || fail STOP_R20F_COMPLETION_CLOCK_BEFORE_ACTIVATION success_state state_update_failure
 reg_state_update mode NORMAL degraded_reason "" degraded_since_epoch 0 failed_attempt_id "" last_refresh_result PASS last_refresh_epoch "$COMPLETION_NOW_EPOCH" next_refresh_epoch 0 active_generation_id "$GEN_ID" healthy_slot_count_at_failure 5 full_refresh_due false full_refresh_request_reason "" full_refresh_request_slot "" full_refresh_request_epoch 0 last_full_refresh_result PASS last_full_refresh_attempt_id "$ATTEMPT_ID" last_full_refresh_previous_generation "$ACTIVE_ID" last_full_refresh_new_generation "$GEN_ID" || fail STOP_R20C_SUCCESS_STATE_FINALIZATION_FAILED success_state state_update_failure
 COMPLETED=true
-reg_event_append full_pool_refresh PASS "$ATTEMPT_ID" "" "" "" "$ACTIVE_ID" "$GEN_ID" success "$COUNTER" 0 "active_generation_replaced=true" >/dev/null 2>&1 || true
+TOPOLOGY_RECONCILE_LOG="$RUN_DIR/logs/topology-reconcile.log"
+if ! "$TOPOLOGY_RECONCILE" --after-full-refresh >"$TOPOLOGY_RECONCILE_LOG" 2>&1; then
+    reconcile_rc=$?
+    cat "$TOPOLOGY_RECONCILE_LOG"
+    echo RESULT=STOP_R20QQ_FULL_REFRESH_TOPOLOGY_RECONCILE_FAILED
+    echo TOPOLOGY_RECONCILE_RC="$reconcile_rc"
+    echo ACTIVE_GENERATION_REPLACED=true
+    echo CORE_CHANGE_COMPLETE=true
+    exit 31
+fi
+cat "$TOPOLOGY_RECONCILE_LOG"
+grep -qx RESULT=PASS_R20QQ_FULL_REFRESH_TOPOLOGY_RECONCILED "$TOPOLOGY_RECONCILE_LOG" || {
+    echo RESULT=STOP_R20QQ_FULL_REFRESH_TOPOLOGY_RECONCILE_MARKER_MISSING
+    echo ACTIVE_GENERATION_REPLACED=true
+    echo CORE_CHANGE_COMPLETE=true
+    exit 31
+}
+reg_event_append full_pool_refresh PASS "$ATTEMPT_ID" "" "" "" "$ACTIVE_ID" "$GEN_ID" success "$COUNTER" 0 "active_generation_replaced=true topology_reconciled=true" >/dev/null 2>&1 || true
 cat >"$RUN_DIR/result.kv" <<EOF
 result=PASS_R20C_FULL_POOL_REFRESH
 attempt_id=$ATTEMPT_ID
@@ -427,6 +445,7 @@ provider_rank_results=$RANK_RESULTS
 provider_ok_count=$ADAPTED_OK_COUNT
 source_pool=$SOURCE_POOL
 runtime_impact=true
+topology_reconciled=true
 EOF
 
 echo RESULT=PASS_R20C_FULL_POOL_REFRESH
@@ -440,5 +459,6 @@ echo "TRIGGER_COUNTER=$COUNTER"
 echo REPAIR_COUNTER_RESET=true
 echo ACTIVE_GENERATION_REPLACED=true
 echo ACTIVE_SLOT_COUNT=5
+echo TOPOLOGY_RECONCILED=true
 echo DIRECT_FAILOPEN_USED=false
 echo RUNTIME_IMPACT=true
