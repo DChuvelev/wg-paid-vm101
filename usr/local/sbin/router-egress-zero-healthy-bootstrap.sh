@@ -1,6 +1,6 @@
 #!/bin/sh
-# R20Q-N: service-owned cached retained-config bootstrap controller for VM101.
-# BusyBox ash compatible. It never performs provider acquisition or heavy full refresh.
+# R20Q-P: cached bootstrap controller with asynchronous provider-direct request handoff.
+# BusyBox ash compatible. It never performs provider acquisition or heavy full refresh synchronously.
 set -u
 umask 077
 export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
@@ -26,16 +26,20 @@ REASON="${ROUTER_BOOTSTRAP_REASON:-${BOOTSTRAP_CONTROLLER_REASON:-zero_healthy_c
 SLOT="${ROUTER_BOOTSTRAP_SLOT:-${BOOTSTRAP_SLOT:-egress1}}"
 RETRY_SEC="${ROUTER_BOOTSTRAP_RETRY_INTERVAL_SEC:-${BOOTSTRAP_RETRY_INTERVAL_SEC:-300}}"
 CANDIDATE_RETRIES="${ROUTER_BOOTSTRAP_CANDIDATE_RETRY_COUNT:-${BOOTSTRAP_CANDIDATE_RETRY_COUNT:-3}}"
+PROVIDER_DIRECT_ENABLED="${ROUTER_BOOTSTRAP_PROVIDER_DIRECT_ENABLED:-${BOOTSTRAP_CONTROLLER_PROVIDER_DIRECT_ENABLED:-0}}"
+PROVIDER_DIRECT_HELPER="${ROUTER_BOOTSTRAP_PROVIDER_DIRECT_HELPER:-${BOOTSTRAP_CONTROLLER_PROVIDER_DIRECT_HELPER:-/usr/local/sbin/router-egress-provider-direct.sh}}"
+PROVIDER_POLL_SEC="${ROUTER_BOOTSTRAP_PROVIDER_POLL_SEC:-${BOOTSTRAP_CONTROLLER_PROVIDER_POLL_SEC:-30}}"
 NOW="${ROUTER_BOOTSTRAP_NOW_EPOCH:-$(date +%s)}"
-SCHEMA=router-egress-zero-healthy-bootstrap-state-v1
+SCHEMA=router-egress-zero-healthy-bootstrap-state-v2
 
 is_uint() { case "$1" in ''|*[!0-9]*) return 1 ;; *) return 0 ;; esac; }
-for value in "$TICK_SEC" "$RETRY_SEC" "$CANDIDATE_RETRIES" "$NOW"; do
+for value in "$TICK_SEC" "$RETRY_SEC" "$CANDIDATE_RETRIES" "$PROVIDER_POLL_SEC" "$NOW"; do
     is_uint "$value" || { echo RESULT=STOP_R20QN_NUMERIC_CONFIG_INVALID; exit 70; }
 done
 [ "$TICK_SEC" -gt 0 ] || TICK_SEC=30
 [ "$RETRY_SEC" -gt 0 ] || RETRY_SEC=300
 [ "$CANDIDATE_RETRIES" -gt 0 ] || CANDIDATE_RETRIES=1
+[ "$PROVIDER_POLL_SEC" -gt 0 ] || PROVIDER_POLL_SEC=30
 case "$SLOT" in egress[1-5]) ;; *) echo RESULT=STOP_R20QN_BOOTSTRAP_SLOT_INVALID; exit 70 ;; esac
 
 kv_get() {
@@ -79,7 +83,7 @@ atomic_write() {
 }
 state_get() { kv_get "$1" "$STATE_FILE"; }
 write_state() {
-    state_mode="$1"; result="$2"; reason="$3"; candidate="$4"; before="$5"; after="$6"; next_epoch="$7"; attempts="$8"; refresh_result="$9"
+    state_mode="$1"; result="$2"; reason="$3"; candidate="$4"; before="$5"; after="$6"; next_epoch="$7"; attempts="$8"; refresh_result="$9"; provider_result="${10:-NOT_REQUESTED}"
     mkdir -p "$STATE_DIR" || return 1; chmod 700 "$STATE_DIR" 2>/dev/null || true
     tmp="$STATE_DIR/state.$$"
     {
@@ -96,6 +100,7 @@ write_state() {
         echo healthy_before="$before"
         echo healthy_after="$after"
         echo refresh_request_result="$refresh_result"
+        echo provider_request_result="$provider_result"
     } > "$tmp" || return 1
     atomic_write "$tmp" "$STATE_FILE" || return 1
     rm -f "$tmp"
@@ -131,6 +136,23 @@ refresh_result_ok() {
 request_refresh() {
     . "$STATE_HELPER"
     reg_request_full_refresh "$REASON" "$SLOT" 2>/dev/null
+}
+provider_reason_eligible() {
+    case "$1" in
+        adapter_dryrun_not_ready_no_pool_file|adapter_dryrun_not_ready_stale_pool|adapter_dryrun_not_ready_no_eligible_candidate_with_config) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+provider_request_result_ok() {
+    case "$1" in
+        REQUESTED_R20QP_PROVIDER_DIRECT|NOOP_R20QP_PROVIDER_ALREADY_PENDING|NOOP_R20QP_PROVIDER_RETRY_ACTIVE|NOOP_R20QP_PROVIDER_ALREADY_READY|NOOP_R20QP_PROVIDER_LOCKED) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+request_provider_direct() {
+    source_generation="$(kv_get source_vm101_generation "$DIRECT_STATE")"
+    [ -n "$source_generation" ] || return 70
+    "$PROVIDER_DIRECT_HELPER" --request "$source_generation" "$1"
 }
 
 mode="${1:---tick}"
@@ -224,14 +246,44 @@ dry_reason="$(printf '%s\n' "$dry_output" | json_get_string reason)"
 candidate="$(printf '%s\n' "$dry_output" | json_get_string candidate_endpoint)"
 confirm="$(printf '%s\n' "$dry_output" | json_get_string required_dispatch_confirm)"
 if [ "$dry_rc" -ne 0 ] || [ "$dry_decision" != dry_run_ok ] || [ -z "$candidate" ] || [ -z "$confirm" ]; then
+    provider_result=NOT_REQUESTED
+    provider_rc=0
+    if [ "$PROVIDER_DIRECT_ENABLED" = 1 ] && provider_reason_eligible "${dry_reason:-}"; then
+        if [ ! -x "$PROVIDER_DIRECT_HELPER" ]; then
+            provider_result=ERROR_PROVIDER_HELPER_MISSING
+            provider_rc=70
+        else
+            provider_output="$(request_provider_direct "${dry_reason:-dispatcher_not_ready}" 2>&1)"; provider_rc=$?
+            provider_result="$(printf '%s\n' "$provider_output" | sed -n 's/^RESULT=//p' | tail -n1)"
+            [ -n "$provider_result" ] || provider_result=ERROR_PROVIDER_RESULT_MISSING
+        fi
+    fi
+    if [ "$provider_rc" -eq 0 ] && provider_request_result_ok "$provider_result"; then
+        due=$((NOW + PROVIDER_POLL_SEC))
+        write_state PROVIDER_WAIT PROVIDER_REQUESTED "${dry_reason:-dispatcher_not_ready}" "$candidate" "$healthy_before" "$healthy_before" "$due" "$attempts" NOT_REQUESTED "$provider_result" || { echo RESULT=STOP_R20QN_STATE_WRITE_FAILED; exit 70; }
+        log_event "result=provider_wait slot=$SLOT reason=${dry_reason:-unknown} provider_request=$provider_result next_attempt_epoch=$due"
+        echo RESULT=RETRY_R20QP_PROVIDER_ACQUISITION_PENDING
+        echo BOOTSTRAP_SLOT="$SLOT"
+        echo DISPATCHER_RC="$dry_rc"
+        echo DISPATCHER_REASON="${dry_reason:-unknown}"
+        echo PROVIDER_REQUEST_RESULT="$provider_result"
+        echo NEXT_ATTEMPT_EPOCH="$due"
+        echo PROVIDER_ACQUISITION_EXECUTED=false
+        echo HEAVY_REFRESH_EXECUTED=false
+        echo BOOTSTRAP_ACTION_PERFORMED=false
+        exit 0
+    fi
     due=$((NOW + RETRY_SEC))
-    write_state RETRY NO_CACHED_CANDIDATE "${dry_reason:-dispatcher_not_ready}" "$candidate" "$healthy_before" "$healthy_before" "$due" "$attempts" NOT_REQUESTED || { echo RESULT=STOP_R20QN_STATE_WRITE_FAILED; exit 70; }
-    log_event "result=no_cached_candidate slot=$SLOT reason=${dry_reason:-unknown} next_attempt_epoch=$due"
+    write_state RETRY NO_CACHED_CANDIDATE "${dry_reason:-dispatcher_not_ready}" "$candidate" "$healthy_before" "$healthy_before" "$due" "$attempts" NOT_REQUESTED "$provider_result" || { echo RESULT=STOP_R20QN_STATE_WRITE_FAILED; exit 70; }
+    log_event "result=no_cached_candidate slot=$SLOT reason=${dry_reason:-unknown} provider_request=$provider_result provider_rc=$provider_rc next_attempt_epoch=$due"
     echo RESULT=NOOP_R20QN_CACHED_BOOTSTRAP_NO_CANDIDATE
     echo BOOTSTRAP_SLOT="$SLOT"
     echo DISPATCHER_RC="$dry_rc"
     echo DISPATCHER_REASON="${dry_reason:-unknown}"
+    echo PROVIDER_REQUEST_RESULT="$provider_result"
     echo NEXT_ATTEMPT_EPOCH="$due"
+    echo PROVIDER_ACQUISITION_EXECUTED=false
+    echo HEAVY_REFRESH_EXECUTED=false
     echo BOOTSTRAP_ACTION_PERFORMED=false
     exit 0
 fi

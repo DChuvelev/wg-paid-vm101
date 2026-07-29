@@ -2,8 +2,8 @@
 
 set -eu
 
-BASE="/root/hmn"
-ENV_FILE="$BASE/hmn.env"
+BASE="${HMN_BASE:-/root/hmn}"
+ENV_FILE="${HMN_ENV_FILE:-$BASE/hmn.env}"
 
 if [ ! -f "$ENV_FILE" ]; then
   echo "ERROR: нет $ENV_FILE"
@@ -26,12 +26,14 @@ if [ -z "${HMN_ACCESS_CODE:-}" ]; then
   exit 1
 fi
 
-if ! command -v curl >/dev/null 2>&1; then
+CURL_BIN="${HMN_CURL_BIN:-curl}"
+SLEEP_BIN="${HMN_SLEEP_BIN:-sleep}"
+if ! command -v "$CURL_BIN" >/dev/null 2>&1; then
   echo "ERROR: нужен curl"
   exit 1
 fi
 
-RUNTIME_LIB="/usr/local/lib/router-egress-vm101-runtime.sh"
+RUNTIME_LIB="${HMN_RUNTIME_LIB:-/usr/local/lib/router-egress-vm101-runtime.sh}"
 
 if [ ! -r "$RUNTIME_LIB" ]; then
   echo "ERROR: нет читаемой runtime library: $RUNTIME_LIB"
@@ -46,6 +48,8 @@ else
   REQUEST_IFACE="${HMN_REQUEST_IFACE:-auto}"
 fi
 
+REQUEST_TRANSPORT=vpn
+DIRECT_IFACE="${HMN_DIRECT_IFACE:-eth0}"
 case "$REQUEST_IFACE" in
   auto)
     ACTIVE="$(vm101_healthy_bootstrap_iface || true)"
@@ -56,12 +60,26 @@ case "$REQUEST_IFACE" in
       echo "ERROR: requested VPN interface is invalid or unhealthy: $REQUEST_IFACE"
       exit 1
     fi
-
     ACTIVE="$REQUEST_IFACE"
     ;;
 
+  direct)
+    case "$DIRECT_IFACE" in
+      ''|*[!A-Za-z0-9_.:-]*)
+        echo "ERROR: invalid direct interface: $DIRECT_IFACE"
+        exit 1
+        ;;
+    esac
+    if ! ip link show dev "$DIRECT_IFACE" >/dev/null 2>&1; then
+      echo "ERROR: direct interface is missing: $DIRECT_IFACE"
+      exit 1
+    fi
+    ACTIVE="$DIRECT_IFACE"
+    REQUEST_TRANSPORT=direct
+    ;;
+
   *)
-    echo "ERROR: requested VPN interface is invalid or unhealthy: $REQUEST_IFACE"
+    echo "ERROR: requested interface mode is invalid: $REQUEST_IFACE"
     exit 1
     ;;
 esac
@@ -88,6 +106,7 @@ SUMMARY_FILE="$RUN_DIR/summary.txt"
 echo "HideMyName download all AWG configs"
 echo
 echo "AWG parameter: awg=$AWG_PARAM"
+echo "Request transport: $REQUEST_TRANSPORT"
 echo "Request interface: $ACTIVE"
 echo "Run dir: $RUN_DIR"
 echo "Config dir: $CONFIG_DIR"
@@ -95,7 +114,7 @@ echo
 
 echo "0/4 Проверяю доступ к hide-my-name.net через $ACTIVE..."
 
-if ! curl -4 --http1.1 --interface "$ACTIVE" \
+if ! "$CURL_BIN" -4 --http1.1 --interface "$ACTIVE" \
   -I --connect-timeout 10 --max-time 25 \
   https://hide-my-name.net/ >/dev/null 2>&1; then
   echo "ERROR: hide-my-name.net не открывается через $ACTIVE"
@@ -107,7 +126,7 @@ echo
 
 echo "1/4 Скачиваю serverlist..."
 
-curl -4 --http1.1 --interface "$ACTIVE" \
+"$CURL_BIN" -4 --http1.1 --interface "$ACTIVE" \
   -sS -L --connect-timeout 10 --max-time 45 \
   -H "Origin: https://hide-my-name.net" \
   -H "Referer: https://hide-my-name.net/vpn/router/" \
@@ -210,7 +229,7 @@ while IFS="$(printf '\t')" read -r SERVER_ID COUNTRY_CODE SERVER_NAME WG_IP WG_P
 
   echo "[$N/$TOTAL] $COUNTRY_CODE | $SERVER_NAME | $EXPECTED_ENDPOINT"
 
-  if curl -4 --http1.1 --interface "$ACTIVE" \
+  if "$CURL_BIN" -4 --http1.1 --interface "$ACTIVE" \
     -sS -L --connect-timeout 8 --max-time 35 \
     -H "Origin: https://hide-my-name.net" \
     -H "Referer: https://hide-my-name.net/vpn/router/" \
@@ -264,7 +283,7 @@ while IFS="$(printf '\t')" read -r SERVER_ID COUNTRY_CODE SERVER_NAME WG_IP WG_P
   fi
 
   echo
-  sleep 1
+  "$SLEEP_BIN" 1
 
 done < "$CANDIDATES_FILE"
 
@@ -283,6 +302,7 @@ chmod 600 "$BASE/cache/"*.tsv 2>/dev/null || true
   echo "HideMyName AWG download summary"
   echo "timestamp=$TS"
   echo "awg=$AWG_PARAM"
+  echo "request_transport=$REQUEST_TRANSPORT"
   echo "request_iface=$ACTIVE"
   echo "total_candidates=$TOTAL"
   echo "ok=$OK"
@@ -324,4 +344,7 @@ awk -F '\t' 'NR==1 {next} {
 }' "$WORKING_FILE"
 
 echo
+echo "PROVIDER_REQUEST_TRANSPORT=$REQUEST_TRANSPORT"
+echo "PROVIDER_REQUEST_INTERFACE=$ACTIVE"
+echo "PROVIDER_NETWORK_MUTATION_PERFORMED=false"
 echo "OpenWRT network config не трогали."
