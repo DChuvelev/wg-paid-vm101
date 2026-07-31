@@ -1,0 +1,20 @@
+#!/bin/sh /etc/rc.common
+START=95
+STOP=12
+
+start() {
+    /usr/local/sbin/router-egress-boot-handoff.sh --boot
+}
+
+stop() {
+    /usr/local/sbin/router-egress-boot-handoff.sh --stop
+}
+
+restart() {
+    stop
+    start
+}
+
+reload_service() {
+    start
+}
