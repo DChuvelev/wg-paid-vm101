@@ -1,0 +1,234 @@
+
+config defaults
+	option input 'REJECT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	option synflood_protect '1'
+
+config zone
+	option name 'wan'
+	option input 'REJECT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	option masq '1'
+	option mtu_fix '1'
+	list network 'wan'
+
+config rule
+	option name 'Allow-DHCP-Renew'
+	option src 'wan'
+	option proto 'udp'
+	option dest_port '68'
+	option target 'ACCEPT'
+	option family 'ipv4'
+
+config rule
+	option name 'Allow-Ping'
+	option src 'wan'
+	option proto 'icmp'
+	option icmp_type 'echo-request'
+	option family 'ipv4'
+	option target 'ACCEPT'
+
+config rule
+	option name 'Allow-IGMP'
+	option src 'wan'
+	option proto 'igmp'
+	option family 'ipv4'
+	option target 'ACCEPT'
+
+config rule
+	option name 'Allow-DHCPv6'
+	option src 'wan'
+	option proto 'udp'
+	option dest_port '546'
+	option family 'ipv6'
+	option target 'ACCEPT'
+
+config rule
+	option name 'Allow-MLD'
+	option src 'wan'
+	option proto 'icmp'
+	option src_ip 'fe80::/10'
+	list icmp_type '130/0'
+	list icmp_type '131/0'
+	list icmp_type '132/0'
+	list icmp_type '143/0'
+	option family 'ipv6'
+	option target 'ACCEPT'
+
+config rule
+	option name 'Allow-ICMPv6-Input'
+	option src 'wan'
+	option proto 'icmp'
+	list icmp_type 'echo-request'
+	list icmp_type 'echo-reply'
+	list icmp_type 'destination-unreachable'
+	list icmp_type 'packet-too-big'
+	list icmp_type 'time-exceeded'
+	list icmp_type 'bad-header'
+	list icmp_type 'unknown-header-type'
+	list icmp_type 'router-solicitation'
+	list icmp_type 'neighbour-solicitation'
+	list icmp_type 'router-advertisement'
+	list icmp_type 'neighbour-advertisement'
+	option limit '1000/sec'
+	option family 'ipv6'
+	option target 'ACCEPT'
+
+config rule
+	option name 'Allow-ICMPv6-Forward'
+	option src 'wan'
+	option dest '*'
+	option proto 'icmp'
+	list icmp_type 'echo-request'
+	list icmp_type 'echo-reply'
+	list icmp_type 'destination-unreachable'
+	list icmp_type 'packet-too-big'
+	list icmp_type 'time-exceeded'
+	list icmp_type 'bad-header'
+	list icmp_type 'unknown-header-type'
+	option limit '1000/sec'
+	option family 'ipv6'
+	option target 'ACCEPT'
+
+config zone
+	option name 'Management'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	option masq '1'
+	list network 'mgmt'
+
+config zone
+	option name 'direct_in'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	list network 'direct_in'
+
+config zone
+	option name 'vpn_in'
+	option input 'ACCEPT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	list network 'vpn_in'
+
+config zone
+	option name 'vpn_out'
+	option input 'REJECT'
+	option output 'ACCEPT'
+	option forward 'REJECT'
+	option masq '1'
+	option mtu_fix '1'
+	list network 'vpn1'
+	list network 'vpn2'
+	list network 'vpn_user'
+	list network 'vpn3'
+	list network 'vpn4'
+	list network 'vpn5'
+
+config nat
+	option name 'OMR_SERVER_SNAT_TO_MGMT'
+	option family 'ipv4'
+	option src 'Management'
+	option proto 'tcp udp'
+	option dest_ip '192.168.30.186'
+	option dest_port '65000-65535'
+	option target 'MASQUERADE'
+
+config rule
+	option name 'Allow-ICMP-from-vpn_in-to-router'
+	option src 'vpn_in'
+	option proto 'icmp'
+	option icmp_type 'echo-request'
+	option family 'ipv4'
+	option target 'ACCEPT'
+
+config forwarding
+	option src 'direct_in'
+	option dest 'wan'
+
+config forwarding
+	option src 'vpn_in'
+	option dest 'vpn_out'
+
+config forwarding
+	option src 'vpn_in'
+	option dest 'wan'
+
+config redirect
+	option name 'WG_easy_51821_to_VM103'
+	option family 'ipv4'
+	option src 'wan'
+	option src_dport '51821'
+	option proto 'udp'
+	option dest 'Management'
+	option dest_ip '10.71.1.189'
+	option dest_port '51821'
+	option target 'DNAT'
+
+config redirect
+	option name 'wg_remote_to_vm100'
+	option src 'wan'
+	option dest 'Management'
+	option src_dport '51820'
+	option dest_ip '10.71.100.1'
+	option dest_port '51820'
+	option proto 'udp'
+	option target 'DNAT'
+
+config redirect 'dnat_wg_paid_51830'
+	option name 'DNAT-WG-Paid-51830-to-VM100'
+	option src 'wan'
+	option src_dport '51830'
+	option dest_ip '10.71.100.1'
+	option dest_port '51830'
+	option proto 'udp'
+	option target 'DNAT'
+	option dest 'Management'
+
+config redirect 'reports_http_80'
+	option name 'Reports HTTP 80 to VM130'
+	option family 'ipv4'
+	option src 'wan'
+	option src_dport '80'
+	option proto 'tcp'
+	option dest 'Management'
+	option dest_ip '10.71.100.84'
+	option dest_port '80'
+	option target 'DNAT'
+	option reflection '1'
+
+config redirect 'reports_https_443'
+	option name 'Reports HTTPS 443 to VM130'
+	option family 'ipv4'
+	option src 'wan'
+	option src_dport '443'
+	option proto 'tcp'
+	option dest 'Management'
+	option dest_ip '10.71.100.84'
+	option dest_port '443'
+	option target 'DNAT'
+	option reflection '1'
+
+config redirect 'beach_omr_xray_65248'
+	option name 'BEACH OMR Xray 65248 to VM102'
+	option src 'wan'
+	option dest 'Management'
+	option src_dport '65248'
+	option dest_ip '10.71.100.85'
+	option dest_port '65248'
+	option proto 'tcp'
+	option target 'DNAT'
+
+config redirect 'beach_omr_openvpn_65301'
+	option name 'BEACH OMR OpenVPN 65301 to VM102'
+	option src 'wan'
+	option dest 'Management'
+	option src_dport '65301'
+	option dest_ip '10.71.100.85'
+	option dest_port '65301'
+	option proto 'tcp'
+	option target 'DNAT'
+
