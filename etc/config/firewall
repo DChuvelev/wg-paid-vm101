@@ -232,3 +232,13 @@ config redirect 'beach_omr_openvpn_65301'
 	option proto 'tcp'
 	option target 'DNAT'
 
+config redirect 'beach_omr_api_65500'
+	option name 'BEACH OMR API 65500 to VM102'
+	option src 'wan'
+	option dest 'Management'
+	option src_dport '65500'
+	option dest_ip '10.71.100.85'
+	option dest_port '65500'
+	option proto 'tcp'
+	option target 'DNAT'
+
