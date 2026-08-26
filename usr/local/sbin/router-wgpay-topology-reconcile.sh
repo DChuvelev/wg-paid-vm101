@@ -8,6 +8,7 @@ export PATH='/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'
 STATUS_CMD="${ROUTER_TOPOLOGY_RECONCILE_STATUS_CMD:-/usr/local/sbin/router-egress-slots-status.sh}"
 SYNC_CMD="${ROUTER_TOPOLOGY_RECONCILE_SYNC_CMD:-/usr/local/sbin/router-wgpay-watcher-topology-sync.sh}"
 OUTBOX_CMD="${ROUTER_TOPOLOGY_RECONCILE_OUTBOX_CMD:-/usr/local/sbin/router-wgpay-topology-outbox.sh}"
+DELIVERY_SERVICE="${ROUTER_TOPOLOGY_RECONCILE_DELIVERY_SERVICE:-/etc/init.d/router-wgpay-topology-delivery}"
 FALLBACK_STATE="${ROUTER_TOPOLOGY_RECONCILE_FALLBACK_STATE:-/etc/router-wgpay-fallback/state.kv}"
 DIRECT_STATE="${ROUTER_TOPOLOGY_RECONCILE_DIRECT_STATE:-/etc/router-wgpay-direct/state.kv}"
 LAST_ACK="${ROUTER_TOPOLOGY_RECONCILE_LAST_ACK:-/etc/router-wgpay-topology-delivery/last-ack.kv}"
@@ -58,8 +59,14 @@ esac
 [ -x "$STATUS_CMD" ] || { echo RESULT=STOP_R20QQ_RECONCILE_STATUS_MISSING; exit 70; }
 [ -x "$SYNC_CMD" ] || { echo RESULT=STOP_R20QQ_RECONCILE_SYNC_MISSING; exit 70; }
 [ -x "$OUTBOX_CMD" ] || { echo RESULT=STOP_R20QQ_RECONCILE_OUTBOX_MISSING; exit 70; }
+[ -x "$DELIVERY_SERVICE" ] || { echo RESULT=STOP_R20QQ_RECONCILE_DELIVERY_SERVICE_MISSING; exit 70; }
 lock_acquire || { echo RESULT=NOOP_R20QQ_RECONCILE_LOCKED; exit 75; }
-trap 'lock_release >/dev/null 2>&1 || true' EXIT HUP INT TERM
+delivery_restart_required=false
+cleanup() {
+    if [ "$delivery_restart_required" = true ]; then "$DELIVERY_SERVICE" start >/dev/null 2>&1 || true; fi
+    lock_release >/dev/null 2>&1 || true
+}
+trap cleanup EXIT HUP INT TERM
 
 set +e
 status="$($STATUS_CMD 2>&1)"
@@ -76,12 +83,22 @@ if [ "$status_rc" -ne 0 ] || [ "$total" != 5 ] || [ "$healthy" != 5 ]; then
     exit 70
 fi
 
+# Freeze the retry loop while local state is reconciled so no intermediate
+# degraded snapshot can be delivered between slot clears.
+"$DELIVERY_SERVICE" stop >/dev/null 2>&1 || { echo RESULT=STOP_R20QQ_RECONCILE_DELIVERY_SERVICE_STOP_FAILED; exit 70; }
+delivery_restart_required=true
+
+# Reconcile the entire local watcher/fallback state first.  Do not attempt
+# delivery after each slot: a stale pending payload may itself be rejected by
+# VM100 and must never prevent later exhausted slots from being cleared.
+# Suppress per-slot outbox sync so only the final, fully reconciled snapshot is
+# allowed to supersede the pending generation.
 changed_count=0
 delivery_count=0
 direct_exit_observed=false
 for slot in egress1 egress2 egress3 egress4 egress5; do
     set +e
-    sync_out="$($SYNC_CMD --bridge-clear "$slot" full_pool_refresh_reconcile 2>&1)"
+    sync_out="$(ROUTER_WGPAY_WATCHER_OUTBOX=/bin/true "$SYNC_CMD" --bridge-clear "$slot" full_pool_refresh_reconcile 2>&1)"
     sync_rc=$?
     set -e
     printf '%s\n' "$sync_out"
@@ -92,34 +109,56 @@ for slot in egress1 egress2 egress3 egress4 egress5; do
         NOOP_WATCHER_TOPOLOGY_STATE_UNCHANGED) ;;
         *) echo RESULT=STOP_R20QQ_RECONCILE_SYNC_RESULT_INVALID; echo SLOT="$slot"; echo SYNC_RESULT="${sync_result:-missing}"; exit 71 ;;
     esac
-
-    set +e
-    outbox_out="$($OUTBOX_CMD --run-once 2>&1)"
-    outbox_rc=$?
-    set -e
-    printf '%s\n' "$outbox_out"
-    [ "$outbox_rc" -eq 0 ] || { echo RESULT=STOP_R20QQ_RECONCILE_DELIVERY_FAILED; echo SLOT="$slot"; echo DELIVERY_RC="$outbox_rc"; exit 72; }
-    outbox_result="$(printf '%s\n' "$outbox_out" | sed -n 's/^RESULT=//p' | tail -n1)"
-    case "$outbox_result" in
-        PASS_TOPOLOGY_ACK_ACCEPTED) delivery_count=$((delivery_count + 1)) ;;
-        NOOP_TOPOLOGY_NOT_PENDING|NOOP_TOPOLOGY_SOURCE_ALREADY_ACKED) ;;
-        *) echo RESULT=STOP_R20QQ_RECONCILE_DELIVERY_RESULT_INVALID; echo SLOT="$slot"; echo DELIVERY_RESULT="${outbox_result:-missing}"; exit 72 ;;
-    esac
-    if [ -f "$LAST_ACK" ]; then
-        [ "$(kv_get direct_action "$LAST_ACK")" = EXIT ] && direct_exit_observed=true
-        [ "$(kv_get direct_action_result "$LAST_ACK")" = PASS_DIRECT_MODE_DISABLED ] && direct_exit_observed=true
-    fi
 done
 
+# Local truth must be fully NORMAL before any delivery is attempted.
 [ "$(kv_get mode "$FALLBACK_STATE")" = NORMAL ] || { echo RESULT=STOP_R20QQ_RECONCILE_MODE_NOT_NORMAL; exit 73; }
 [ "$(kv_get healthy_slots "$FALLBACK_STATE")" = egress1,egress2,egress3,egress4,egress5 ] || { echo RESULT=STOP_R20QQ_RECONCILE_HEALTHY_SET_INVALID; exit 73; }
 [ -z "$(kv_get exhausted_slots "$FALLBACK_STATE")" ] || { echo RESULT=STOP_R20QQ_RECONCILE_EXHAUSTED_REMAINS; exit 73; }
 [ ! -e "$DIRECT_STATE" ] || { echo RESULT=STOP_R20QQ_RECONCILE_DIRECT_SOURCE_REMAINS; exit 73; }
+
+# Now supersede any stale pending generation once, using the final NORMAL
+# snapshot, and attempt that single current generation.
+set +e
+outbox_sync_out="$($OUTBOX_CMD --sync 2>&1)"
+outbox_sync_rc=$?
+set -e
+printf '%s\n' "$outbox_sync_out"
+[ "$outbox_sync_rc" -eq 0 ] || { echo RESULT=STOP_R20QQ_RECONCILE_OUTBOX_SYNC_FAILED; echo DELIVERY_RC="$outbox_sync_rc"; exit 72; }
+outbox_sync_result="$(printf '%s\n' "$outbox_sync_out" | sed -n 's/^RESULT=//p' | tail -n1)"
+case "$outbox_sync_result" in
+    PASS_TOPOLOGY_GENERATION_CREATED|NOOP_TOPOLOGY_PENDING_REPLAY|NOOP_TOPOLOGY_SOURCE_ALREADY_ACKED) ;;
+    *) echo RESULT=STOP_R20QQ_RECONCILE_OUTBOX_SYNC_RESULT_INVALID; echo DELIVERY_RESULT="${outbox_sync_result:-missing}"; exit 72 ;;
+esac
+
+if [ "$outbox_sync_result" != NOOP_TOPOLOGY_SOURCE_ALREADY_ACKED ]; then
+    set +e
+    outbox_out="$($OUTBOX_CMD --attempt 2>&1)"
+    outbox_rc=$?
+    set -e
+    printf '%s\n' "$outbox_out"
+    [ "$outbox_rc" -eq 0 ] || { echo RESULT=STOP_R20QQ_RECONCILE_DELIVERY_FAILED; echo DELIVERY_RC="$outbox_rc"; exit 72; }
+    outbox_result="$(printf '%s\n' "$outbox_out" | sed -n 's/^RESULT=//p' | tail -n1)"
+    case "$outbox_result" in
+        PASS_TOPOLOGY_ACK_ACCEPTED) delivery_count=1 ;;
+        NOOP_TOPOLOGY_NOT_PENDING) ;;
+        *) echo RESULT=STOP_R20QQ_RECONCILE_DELIVERY_RESULT_INVALID; echo DELIVERY_RESULT="${outbox_result:-missing}"; exit 72 ;;
+    esac
+fi
+
+if [ -f "$LAST_ACK" ]; then
+    [ "$(kv_get direct_action "$LAST_ACK")" = EXIT ] && direct_exit_observed=true
+    [ "$(kv_get direct_action_result "$LAST_ACK")" = PASS_DIRECT_MODE_DISABLED ] && direct_exit_observed=true
+fi
+
+"$DELIVERY_SERVICE" start >/dev/null 2>&1 || { echo RESULT=STOP_R20QQ_RECONCILE_DELIVERY_SERVICE_START_FAILED; exit 70; }
+delivery_restart_required=false
 
 echo RESULT=PASS_R20QQ_FULL_REFRESH_TOPOLOGY_RECONCILED
 echo FIVE_HEALTHY_PROVED=true
 echo RECONCILED_SLOT_COUNT="$changed_count"
 echo DELIVERY_ACK_COUNT="$delivery_count"
 echo DIRECT_EXIT_OBSERVED="$direct_exit_observed"
+echo DELIVERY_AFTER_FULL_LOCAL_RECONCILE=true
 echo PROVIDER_ACQUISITION_EXECUTED=false
 echo HEAVY_REFRESH_EXECUTED=false
