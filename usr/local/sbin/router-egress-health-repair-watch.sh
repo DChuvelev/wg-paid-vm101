@@ -15,6 +15,8 @@ SLOTS_CONF="${SLOTS_CONF:-/etc/router-egress-slots.d/slots.conf}"
 STATE_ROOT="${STATE_DIR:-/var/lib/router-egress-recovery}"
 WATCH_STATE_DIR="$STATE_ROOT/health-watch"
 LOG="${HEALTH_REPAIR_LOG:-/var/log/router-egress-health-repair.log}"
+LOG_MAX_BYTES="${HEALTH_REPAIR_LOG_MAX_BYTES:-1048576}"
+LOG_KEEP_LINES="${HEALTH_REPAIR_LOG_KEEP_LINES:-200}"
 DISPATCHER="${RECOVERY_DISPATCHER:-/usr/local/sbin/router-egress-recovery-dispatcher.sh}"
 FULL_REFRESH_ORCHESTRATOR="${FULL_POOL_REFRESH_ORCHESTRATOR:-/usr/local/sbin/router-egress-full-pool-refresh.sh}"
 STATE_HELPER="${RECOVERY_STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}"
@@ -35,7 +37,9 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$MODE" in --dry-run|--commit) ;; *) echo "ERROR=invalid_mode:$MODE" >&2; exit 2 ;; esac
-case "$FAIL_THRESHOLD:$INTERVAL_SEC:$COOLDOWN_SEC" in *[!0-9:]*) echo 'ERROR=invalid_numeric_configuration' >&2; exit 2 ;; esac
+case "$FAIL_THRESHOLD:$INTERVAL_SEC:$COOLDOWN_SEC:$LOG_MAX_BYTES:$LOG_KEEP_LINES" in *[!0-9:]*) echo 'ERROR=invalid_numeric_configuration' >&2; exit 2 ;; esac
+[ "$LOG_MAX_BYTES" -ge 65536 ] || { echo 'ERROR=health_log_max_bytes_too_small' >&2; exit 2; }
+[ "$LOG_KEEP_LINES" -ge 20 ] || { echo 'ERROR=health_log_keep_lines_too_small' >&2; exit 2; }
 [ -r "$SLOTS_CONF" ] || { echo "ERROR=slots_conf_missing:$SLOTS_CONF" >&2; exit 2; }
 [ -x "$DISPATCHER" ] || { echo "ERROR=dispatcher_missing:$DISPATCHER" >&2; exit 2; }
 [ -r "$STATE_HELPER" ] || { echo "ERROR=state_helper_missing:$STATE_HELPER" >&2; exit 2; }
@@ -43,6 +47,31 @@ mkdir -p "$WATCH_STATE_DIR" "$(dirname "$LOG")" || exit 2
 
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 uint_or_zero() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+
+health_log_bound() {
+    [ -f "$LOG" ] || return 0
+    size="$(wc -c < "$LOG" 2>/dev/null || echo 0)"
+    case "$size" in ''|*[!0-9]*) size=0 ;; esac
+    [ "$size" -gt "$LOG_MAX_BYTES" ] || return 0
+    trim="${LOG}.trim.$$"
+    {
+        echo "__ROUTER_EGRESS_HEALTH_REPAIR_LOG_TRUNCATED__ original_bytes=$size max_bytes=$LOG_MAX_BYTES keep_lines=$LOG_KEEP_LINES"
+        tail -n "$LOG_KEEP_LINES" "$LOG" 2>/dev/null || true
+    } > "$trim" || { rm -f "$trim"; return 1; }
+    trim_size="$(wc -c < "$trim" 2>/dev/null || echo 0)"
+    case "$trim_size" in ''|*[!0-9]*) trim_size=0 ;; esac
+    if [ "$trim_size" -gt "$LOG_MAX_BYTES" ]; then
+        keep_bytes=$((LOG_MAX_BYTES / 2))
+        byte_trim="${LOG}.bytes.$$"
+        {
+            echo "__ROUTER_EGRESS_HEALTH_REPAIR_LOG_TRUNCATED_BYTES__ original_bytes=$size max_bytes=$LOG_MAX_BYTES keep_bytes=$keep_bytes"
+            tail -c "$keep_bytes" "$LOG" 2>/dev/null || true
+        } > "$byte_trim" || { rm -f "$trim" "$byte_trim"; return 1; }
+        mv -f "$byte_trim" "$trim" || { rm -f "$trim" "$byte_trim"; return 1; }
+    fi
+    chmod 0644 "$trim" 2>/dev/null || true
+    mv -f "$trim" "$LOG"
+}
 
 slot_ok() {
     iface="$1"
@@ -62,6 +91,7 @@ slot_ok() {
 }
 
 run_once() {
+    health_log_bound || true
     now="$(date +%s)"
     rows="/tmp/router-egress-health-rows.$$"
     json="/tmp/router-egress-health-json.$$"
@@ -196,6 +226,7 @@ run_once() {
         "$(json_escape "$MODE")" "$RUN_MODE" "$any_action"
     cat "$json"
     printf '\n  ]\n}\n'
+    health_log_bound || true
 }
 
 if [ "$ENABLED" != "1" ] && [ "$ONCE" != true ]; then
