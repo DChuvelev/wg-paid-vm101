@@ -353,7 +353,11 @@ case "$mode" in
     --status) status_emit; exit 0;;
     --stop)
         rm -f "$READY_FILE"
-        for service in $SERVICE_ORDER; do [ -x "$INITD_DIR/$service" ] && "$INITD_DIR/$service" stop >/dev/null 2>&1 || true; done
+        # Stop consumers before their dependencies. In particular daily
+        # optimizer cleanup may restore health before health itself is stopped.
+        stop_order=""
+        for service in $SERVICE_ORDER; do stop_order="$service $stop_order"; done
+        for service in $stop_order; do [ -x "$INITD_DIR/$service" ] && "$INITD_DIR/$service" stop >/dev/null 2>&1 || true; done
         [ -x "$SLOTS_APPLY" ] && "$SLOTS_APPLY" stop >/dev/null 2>&1 || true
         echo RESULT=PASS_R20QUB_BOOT_HANDOFF_STOPPED
         exit 0

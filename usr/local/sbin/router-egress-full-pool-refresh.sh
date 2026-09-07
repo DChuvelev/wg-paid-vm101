@@ -79,6 +79,7 @@ GENERATION_ACTIVATION_AUTH_DIR="${ROUTER_EGRESS_ACTIVATION_AUTH_DIR:-${GENERATIO
 
 COORDINATOR_LOCK="$REG_LOCK_DIR/recovery-coordinator.lock"
 FULL_LOCK="$REG_LOCK_DIR/full-pool-refresh.lock"
+DAILY_QUALITY_LOCK="$REG_LOCK_DIR/daily-quality.lock"
 COORDINATOR_LOCK_OWNED=false
 FULL_LOCK_OWNED=false
 ATTEMPT_ID=""
@@ -164,7 +165,10 @@ EOF_FAILURE
     fi
     exit "$rc"
 }
-trap cleanup EXIT HUP INT TERM
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # A killed previous attempt is converted to durable DEGRADED_POOL; retry remains controller-owned.
 if [ "$MODE" = FULL_POOL_REFRESH_RUNNING ] && [ ! -d "$COORDINATOR_LOCK" ] && [ ! -d "$FULL_LOCK" ]; then
@@ -200,12 +204,21 @@ else
     fi
 fi
 
+if reg_lock_is_live daily-quality.lock; then
+    echo RESULT=NOOP_R21B_FULL_POOL_REFRESH_DAILY_QUALITY_BUSY
+    exit 0
+fi
+
 if [ "${ROUTER_EGRESS_COORDINATOR_LOCK_HELD:-0}" = 1 ]; then
     [ -d "$COORDINATOR_LOCK" ] || { echo RESULT=STOP_R20C_CALLER_COORDINATOR_LOCK_MISSING; exit 24; }
 else
     acquired_coord="$(reg_lock_acquire recovery-coordinator.lock r20c-full-pool-refresh 2>/dev/null || true)"
     [ -n "$acquired_coord" ] || { echo RESULT=NOOP_R20C_RECOVERY_COORDINATOR_BUSY; exit 0; }
     COORDINATOR_LOCK_OWNED=true
+fi
+if reg_lock_is_live daily-quality.lock; then
+    echo RESULT=NOOP_R21B_FULL_POOL_REFRESH_DAILY_QUALITY_BUSY
+    exit 0
 fi
 acquired_full="$(reg_lock_acquire full-pool-refresh.lock r20c-full-pool-refresh 2>/dev/null || true)"
 [ -n "$acquired_full" ] || { echo RESULT=NOOP_R20C_FULL_POOL_REFRESH_LOCK_BUSY; exit 0; }
@@ -286,7 +299,7 @@ CONFIG_DIR="$(readlink -f "$LATEST_LINK" 2>/dev/null || true)"
 [ -n "$CONFIG_DIR" ] && [ -d "$CONFIG_DIR" ] || fail STOP_R20C_PROVIDER_CONFIG_DIR_INVALID config_dir provider_schema_adapter_failure
 
 echo ">>> [R20C] provider candidate testing"
-stream_command provider-test "$TESTER" "$CONFIG_DIR" || fail STOP_R20C_PROVIDER_TEST_FAILED provider_test provider_test_failure
+stream_command provider-test env ROUTER_EGRESS_COORDINATOR_LOCK_HELD=1 "$TESTER" "$CONFIG_DIR" || fail STOP_R20C_PROVIDER_TEST_FAILED provider_test provider_test_failure
 RESULTS=""
 RESULTS_MTIME=0
 for candidate in "$PROVIDER_ROOT"/test-runs/*/results.tsv; do

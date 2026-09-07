@@ -18,10 +18,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 SLOTS_CONF="${SLOTS_CONF:-/etc/router-egress-slots.d/slots.conf}"
-HMN_CACHE_DIR="${HMN_CACHE_DIR:-/root/hmn/cache}"
+HMN_CACHE_DIR="${ROUTER_EGRESS_HMN_CACHE_DIR_OVERRIDE:-${HMN_CACHE_DIR:-/root/hmn/cache}}"
 HMN_CONFIG_ROOT="${HMN_CONFIG_ROOT:-/root/hmn/configs/awg1}"
 MAX_POOL_AGE_SEC="${MAX_POOL_AGE_SEC:-129600}"
-PREFERRED_POOL_FILES="${PREFERRED_POOL_FILES:-ok-awg1-strict-foreign-latest.tsv ok-awg1-strict-all-latest.tsv working-awg1-latest.tsv ranked-awg1-latest.tsv}"
+PREFERRED_POOL_FILES="${ROUTER_EGRESS_HMN_PREFERRED_POOL_FILES_OVERRIDE:-${PREFERRED_POOL_FILES:-ok-awg1-strict-foreign-latest.tsv ok-awg1-strict-all-latest.tsv working-awg1-latest.tsv ranked-awg1-latest.tsv}}"
 STATE_DIR="${STATE_DIR:-/var/lib/router-egress-recovery}"
 STATE_HELPER="${STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}"
 LOG="${LOG:-/var/log/router-egress-recovery-hmn.log}"
@@ -40,6 +40,7 @@ AWG_BIN="${AWG_BIN:-/usr/bin/amneziawg}"
 SHA256_BIN="${SHA256_BIN:-sha256sum}"
 HTTPS_ORACLE="${HTTPS_HEALTH_ORACLE:-/usr/local/lib/router-egress-https-health.sh}"
 IDENTITY_BIN="${HMN_TUNNEL_IDENTITY:-/usr/local/lib/router-egress-hmn-identity.sh}"
+QUARANTINE_FAILED_CANDIDATE="${HMN_SLOT_REPLACE_QUARANTINE_FAILED_CANDIDATE:-1}"
 
 mkdir -p "$STATE_DIR" "$(dirname "$LOG")" 2>/dev/null || true
 
@@ -205,7 +206,9 @@ pool_candidate_pairs() (
     awk -F '\t' 'NR>1 {
         ep=""; path=""
         for(i=1;i<=NF;i++){
-            if($i ~ /^([A-Za-z0-9._-]+\.[A-Za-z]{2,}|[0-9]{1,3}(\.[0-9]{1,3}){3}):[0-9]{2,5}$/) ep=$i
+            # Keep field discovery portable across mawk and BusyBox awk. The
+            # selected value is strictly validated by config_binding_valid().
+            if($i ~ /^[A-Za-z0-9._-]+:[0-9]+$/) ep=$i
             if($i ~ /^\// && $i ~ /\.conf$/) path=$i
         }
         if(ep!="" && path!="") print ep "\t" path
@@ -264,7 +267,7 @@ write_result() {
         echo "    \"requires_explicit_commit\": $([ "$REQUIRE_EXPLICIT_COMMIT" = 1 ] && echo true || echo false),"
         echo '    "slot_is_required": true,'
         echo '    "quarantine_is_enforced": true,'
-        echo '    "failed_candidates_are_quarantined": true,'
+        echo "    \"failed_candidates_are_quarantined\": $([ "$QUARANTINE_FAILED_CANDIDATE" = 1 ] && echo true || echo false),"
         echo '    "full_candidate_config_binding_required": true,'
         echo '    "binding_failure_is_not_quarantined": true,'
         echo '    "all_candidates_failed_restores_original_network": true,'
@@ -283,7 +286,8 @@ refuse_json() { printf '{"schema":"router-egress-hmn-slot-replace-v4","decision"
 [ -x "$IDENTITY_BIN" ] || refuse_json identity_helper_missing
 . "$STATE_HELPER"
 reg_init_state >/dev/null 2>&1 || refuse_json state_init_failed
-operation_lock=''; operation_lock_owned=false
+operation_lock=''; coordinator_lock=''; operation_lock_owned=false; coordinator_lock_owned=false; transaction_active=false
+case "$QUARANTINE_FAILED_CANDIDATE" in 0|1) ;; *) refuse_json invalid_quarantine_policy ;; esac
 slot_line="$(grep -Ev '^[[:space:]]*(#|$)' "$SLOTS_CONF" | awk -v slot="$SLOT" '$1==slot {print; exit}')"
 [ -n "$slot_line" ] || refuse_json slot_not_found
 set -- $slot_line
@@ -295,9 +299,38 @@ is_uint "$strict_count" || strict_count=3; is_uint "$strict_timeout" || strict_t
 is_uint "$LOCAL_REPAIR_CANDIDATE_RETRIES" || LOCAL_REPAIR_CANDIDATE_RETRIES=3; [ "$LOCAL_REPAIR_CANDIDATE_RETRIES" -gt 0 ] || LOCAL_REPAIR_CANDIDATE_RETRIES=1
 now="$(date +%s)"; iso="$(date -u '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date)"; current_ep="$(current_endpoint_for_iface "$iface")"
 used_file="/tmp/router-egress-hmn-used.$$"; pool_file="/tmp/router-egress-hmn-pool.$$"; candidate_file="/tmp/router-egress-hmn-candidates.$$"; result_file="${STATE_DIR}/hmn-pool-replace-last.json"
-trap 'rm -f "$used_file" "$pool_file" "$candidate_file"; [ "$operation_lock_owned" = true ] && rmdir "$operation_lock" 2>/dev/null || true' EXIT HUP INT TERM
-if [ "$MODE" = '--commit' ] && [ "${ROUTER_EGRESS_LOCAL_REPAIR_LOCK_HELD:-0}" != 1 ]; then
-    operation_lock="${REG_LOCK_DIR}/local-repair.lock"; mkdir "$operation_lock" 2>/dev/null || refuse_json local_repair_lock_busy; operation_lock_owned=true
+cleanup_slot() {
+    if [ "$transaction_active" = true ]; then
+        if "$rollback_file" >/dev/null 2>&1 && cmp -s "$NETWORK_CONFIG" "${backup_dir}/network.before"; then
+            echo 'INTERRUPT_ROLLBACK_OK=true' >&2
+        else
+            echo 'INTERRUPT_ROLLBACK_OK=false' >&2
+        fi
+        transaction_active=false
+    fi
+    rm -f "$used_file" "$pool_file" "$candidate_file"
+    [ "$operation_lock_owned" != true ] || reg_lock_release "$operation_lock" >/dev/null 2>&1 || true
+    [ "$coordinator_lock_owned" != true ] || reg_lock_release "$coordinator_lock" >/dev/null 2>&1 || true
+}
+trap 'cleanup_slot' EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+if [ "$MODE" = '--commit' ]; then
+    if [ "${ROUTER_EGRESS_COORDINATOR_LOCK_HELD:-0}" = 1 ]; then
+        [ -d "$REG_LOCK_DIR/recovery-coordinator.lock" ] || refuse_json recovery_coordinator_lock_missing
+    else
+        coordinator_lock="$(reg_lock_acquire recovery-coordinator.lock hmn-slot-replace 2>/dev/null || true)"
+        [ -n "$coordinator_lock" ] || refuse_json recovery_coordinator_lock_busy
+        coordinator_lock_owned=true
+    fi
+    if [ "${ROUTER_EGRESS_LOCAL_REPAIR_LOCK_HELD:-0}" = 1 ]; then
+        [ -d "$REG_LOCK_DIR/local-repair.lock" ] || refuse_json local_repair_lock_missing
+    else
+        operation_lock="$(reg_lock_acquire local-repair.lock hmn-slot-replace 2>/dev/null || true)"
+        [ -n "$operation_lock" ] || refuse_json local_repair_lock_busy
+        operation_lock_owned=true
+    fi
 fi
 : >"$used_file"
 for active_iface in vpn1 vpn2 vpn3 vpn4 vpn5; do
@@ -358,21 +391,24 @@ elif [ "$MODE" = '--commit' ]; then
     expected="APPLY_${SLOT}_${iface}_${candidate}"
     if [ "$REQUIRE_EXPLICIT_COMMIT" = 1 ] && [ "$CONFIRM" != "$expected" ]; then reason=missing_or_wrong_confirm_token
     else
-        backup_dir="${STATE_DIR}/backup-${SLOT}-$(date -u +%Y%m%d-%H%M%S)"; mkdir -p "$backup_dir" || { reason=backup_dir_create_failed; write_result "$result_file"; cat "$result_file"; exit 2; }
+        backup_dir="${STATE_DIR}/backup-${SLOT}-$(date -u +%Y%m%d-%H%M%S)-$$"; mkdir "$backup_dir" || { reason=backup_dir_create_failed; write_result "$result_file"; cat "$result_file"; exit 2; }
         cp -p "$NETWORK_CONFIG" "${backup_dir}/network.before" || { reason=network_backup_failed; write_result "$result_file"; cat "$result_file"; exit 2; }
         chmod 600 "${backup_dir}/network.before"; "$UCI_BIN" show network >"${backup_dir}/network.uci.before" 2>/dev/null || true; "$IP_BIN" route show table "$table" >"${backup_dir}/table.before" 2>/dev/null || true
         rollback_file="${backup_dir}/rollback-${SLOT}.sh"
         cat >"$rollback_file" <<EOF_ROLLBACK
 #!/bin/sh
-set -u
+set -eu
 cp -p '${backup_dir}/network.before' '${NETWORK_CONFIG}'
+'${UCI_BIN}' -q revert network >/dev/null 2>&1 || true
 '${IFDOWN_BIN}' '${iface}' >/dev/null 2>&1 || true
-'${IFUP_BIN}' '${iface}' >/dev/null 2>&1 || true
+'${IFUP_BIN}' '${iface}' >/dev/null 2>&1
 '${SLEEP_BIN}' '${POST_APPLY_SLEEP_SEC}'
-if [ -x '${SLOTS_APPLY}' ]; then '${SLOTS_APPLY}' start '${SLOT}' >/dev/null 2>&1 || true; fi
+if [ -x '${SLOTS_APPLY}' ]; then '${SLOTS_APPLY}' start '${SLOT}' >/dev/null 2>&1; fi
+cmp -s '${NETWORK_CONFIG}' '${backup_dir}/network.before'
 echo 'rollback_done=true'
 EOF_ROLLBACK
         chmod 700 "$rollback_file"
+        transaction_active=true
         attempt_limit="$LOCAL_REPAIR_CANDIDATE_RETRIES"; [ "$candidate_count" -lt "$attempt_limit" ] && attempt_limit="$candidate_count"
         while IFS="$(printf '\t')" read -r attempt_candidate attempt_config; do
             [ "$candidate_attempts" -lt "$attempt_limit" ] || break; [ -n "$attempt_candidate" ] && [ -n "$attempt_config" ] || continue
@@ -387,7 +423,9 @@ EOF_ROLLBACK
             if [ "$binding_consistency_ok" = true ] && [ "$metadata_endpoint_after_apply" = "$candidate" ] && [ "$peer_uci_endpoint_after_apply" = "$candidate" ] && [ "$live_endpoint_after_apply" = "$candidate" ]; then endpoint_consistency_ok=true; fi
             if [ "$apply_rc" -ne 0 ] || [ "$binding_consistency_ok" != true ] || [ "$endpoint_consistency_ok" != true ]; then apply_mechanism_failed=true; reason=candidate_full_config_not_applied; break; fi
             if "$IP_BIN" link show "$iface" >/dev/null 2>&1 && "$IP_BIN" route show table "$table" 2>/dev/null | grep -Eq "default[[:space:]].*dev[[:space:]]+${iface}([[:space:]]|$)" && strict_https "$iface"; then decision=commit_ok; reason=candidate_full_config_applied_live_verified_and_https_ok; post_strict_ok=true; break; fi
-            reg_quarantine_endpoint "$candidate" "$SLOT" "$iface" '' repair_candidate_failed "$selected_pool" STEP_050M07R20L_FULL_CANDIDATE_CONFIG_BINDING >/dev/null 2>&1 || true
+            if [ "$QUARANTINE_FAILED_CANDIDATE" = 1 ]; then
+                reg_quarantine_endpoint "$candidate" "$SLOT" "$iface" '' repair_candidate_failed "$selected_pool" STEP_050M07R20L_FULL_CANDIDATE_CONFIG_BINDING >/dev/null 2>&1 || true
+            fi
         done <"$candidate_file"
         if [ "$decision" != commit_ok ]; then
             rollback_performed=true
@@ -400,6 +438,7 @@ EOF_ROLLBACK
             elif [ "$rollback_ok" = true ]; then reason=all_candidates_failed_original_network_restored
             else reason=all_candidates_failed_original_network_restore_failed; fi
         fi
+        transaction_active=false
     fi
 else reason=unsupported_mode
 fi

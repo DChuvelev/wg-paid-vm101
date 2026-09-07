@@ -174,7 +174,15 @@ run_once() {
                     [ -n "$decision" ] || decision=commit_failed_no_decision
                     action=commit_dispatch
                     any_action=true
-                    echo $((now + COOLDOWN_SEC)) >"$cooldown_file"
+                    case "$adapter_reason" in
+                        recovery_coordinator_lock_busy|local_repair_lock_busy)
+                            action=commit_deferred_lock_busy
+                            decision=deferred_lock_busy
+                            ;;
+                        *)
+                            echo $((now + COOLDOWN_SEC)) >"$cooldown_file"
+                            ;;
+                    esac
                     if [ "$dispatcher_rc" -eq 0 ] && [ "$decision" = commit_ok ]; then
                         echo 0 >"$fail_file"
                         fail_count=0

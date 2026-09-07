@@ -95,6 +95,12 @@ owner_tick() {
             ;;
     esac
 
+    if reg_lock_is_live daily-quality.lock; then
+        echo RESULT=NOOP_R21B_REFRESH_OWNER_DAILY_QUALITY_BUSY
+        echo MODE="$mode"
+        return 0
+    fi
+
     coordinator="$(reg_lock_acquire recovery-coordinator.lock r20qub-refresh-owner 2>/dev/null || true)"
     if [ -z "$coordinator" ]; then
         echo RESULT=NOOP_R20QUB_REFRESH_OWNER_COORDINATOR_BUSY
@@ -106,7 +112,16 @@ owner_tick() {
         coordinator=""
         trap - EXIT HUP INT TERM
     }
-    trap release_owner_lock EXIT HUP INT TERM
+    trap release_owner_lock EXIT
+    trap 'exit 129' HUP
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    if reg_lock_is_live daily-quality.lock; then
+        echo RESULT=NOOP_R21B_REFRESH_OWNER_DAILY_QUALITY_BUSY
+        release_owner_lock
+        return 0
+    fi
 
     mode="$(reg_get_state mode NORMAL 2>/dev/null || echo NORMAL)"
     due="$(reg_get_state next_refresh_epoch 0 2>/dev/null || echo 0)"

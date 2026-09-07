@@ -102,6 +102,7 @@ if [ -z "$SOURCE_POOL" ]; then
     done
 fi
 [ -s "$SOURCE_POOL" ] || { echo RESULT=STOP_SOURCE_POOL_MISSING; echo "SOURCE_POOL=$SOURCE_POOL"; exit 23; }
+SOURCE_POOL="$(readlink -f "$SOURCE_POOL")"
 EXPECTED_POOL_HEADER="$(printf 'rank\tavg_ms\tfile\tendpoint\tloss\tconfig_path')"
 [ "$(head -n1 "$SOURCE_POOL")" = "$EXPECTED_POOL_HEADER" ] || { echo RESULT=STOP_SOURCE_POOL_HEADER; exit 23; }
 POOL_MTIME="$(stat -c %Y "$SOURCE_POOL" 2>/dev/null || true)"

@@ -26,30 +26,85 @@ reg_process_token() {
     awk '{print $22}' "/proc/$reg_pid/stat" 2>/dev/null
 }
 
+# Serialize the short metadata publication/reclamation window with flock,
+# already required by VM101 topology delivery. Do not hold flock over network
+# work. Directory paths remain the public lock interface for existing owners.
+reg_lock_metadata_guard() {
+    reg_guard_attempt=0
+    while ! flock -n 9; do
+        reg_guard_attempt=$((reg_guard_attempt + 1))
+        [ "$reg_guard_attempt" -lt 5 ] || return 1
+        sleep 1
+    done
+}
+
+reg_lock_dir_acquire() (
+    reg_dl_path="$1"; reg_dl_owner="${2:-unknown}"
+    reg_lock_metadata_guard || return 1
+    if mkdir "$reg_dl_path" 2>/dev/null; then :; else
+        reg_dl_pid="$(cat "$reg_dl_path/pid" 2>/dev/null || true)"
+        reg_dl_token="$(cat "$reg_dl_path/process_token" 2>/dev/null || true)"
+        reg_dl_live=""
+        case "$reg_dl_pid" in
+            ''|*[!0-9]*) ;;
+            *)
+                reg_dl_live="$(reg_process_token "$reg_dl_pid" 2>/dev/null || true)"
+                [ -n "$reg_dl_token" ] && [ "$reg_dl_live" = "$reg_dl_token" ] && return 1
+                # A live owner with incomplete metadata is still the owner.
+                if [ -z "$reg_dl_token" ] && kill -0 "$reg_dl_pid" 2>/dev/null; then return 1; fi
+                ;;
+        esac
+        if [ -z "$reg_dl_pid" ] || [ -z "$reg_dl_token" ]; then
+            reg_dl_mtime="$(stat -c %Y "$reg_dl_path" 2>/dev/null || true)"
+            case "$reg_dl_mtime" in ''|*[!0-9]*) return 1 ;; esac
+            [ $(( $(reg_now_epoch) - reg_dl_mtime )) -ge 60 ] || return 1
+        fi
+        rm -rf "$reg_dl_path" 2>/dev/null || return 1
+        mkdir "$reg_dl_path" 2>/dev/null || return 1
+    fi
+    printf '%s\n' "$$" >"$reg_dl_path/pid" || { rm -rf "$reg_dl_path"; return 1; }
+    reg_process_token "$$" >"$reg_dl_path/process_token" 2>/dev/null || : >"$reg_dl_path/process_token"
+    printf '%s\n' "$reg_dl_owner" >"$reg_dl_path/owner" || { rm -rf "$reg_dl_path"; return 1; }
+    reg_now_epoch >"$reg_dl_path/acquired_epoch" || { rm -rf "$reg_dl_path"; return 1; }
+    printf '%s\n' "$reg_dl_path"
+ ) 9>"$REG_LOCK_DIR/.metadata.guard"
+
+reg_lock_dir_release() (
+    reg_dl_path="$1"
+    reg_lock_metadata_guard || return 1
+    [ "$(cat "$reg_dl_path/pid" 2>/dev/null || true)" = "$$" ] || return 1
+    reg_dl_token="$(cat "$reg_dl_path/process_token" 2>/dev/null || true)"
+    [ -z "$reg_dl_token" ] || [ "$(reg_process_token "$$" 2>/dev/null || true)" = "$reg_dl_token" ] || return 1
+    rm -rf "$reg_dl_path"
+ ) 9>"$REG_LOCK_DIR/.metadata.guard"
+
+reg_lock_is_live() {
+    reg_li_path="$REG_LOCK_DIR/$1"
+    [ -d "$reg_li_path" ] || return 1
+    reg_li_pid="$(cat "$reg_li_path/pid" 2>/dev/null || true)"
+    reg_li_token="$(cat "$reg_li_path/process_token" 2>/dev/null || true)"
+    case "$reg_li_pid" in
+        ''|*[!0-9]*) ;;
+        *)
+            if [ -n "$reg_li_token" ]; then
+                [ "$(reg_process_token "$reg_li_pid" 2>/dev/null || true)" = "$reg_li_token" ]
+                return $?
+            fi
+            kill -0 "$reg_li_pid" 2>/dev/null && return 0
+            ;;
+    esac
+    reg_li_mtime="$(stat -c %Y "$reg_li_path" 2>/dev/null || true)"
+    case "$reg_li_mtime" in ''|*[!0-9]*) return 0 ;; esac
+    [ $(( $(reg_now_epoch) - reg_li_mtime )) -lt 60 ]
+}
+
 reg_state_write_lock_acquire() {
     mkdir -p "$REG_LOCK_DIR" 2>/dev/null || return 1
-    reg_sw_lock="$REG_LOCK_DIR/state-write.lock"
-    if mkdir "$reg_sw_lock" 2>/dev/null; then :; else
-        reg_sw_pid="$(cat "$reg_sw_lock/pid" 2>/dev/null || true)"
-        reg_sw_token="$(cat "$reg_sw_lock/process_token" 2>/dev/null || true)"
-        reg_sw_live=""
-        case "$reg_sw_pid" in ''|*[!0-9]*) ;; *) reg_sw_live="$(reg_process_token "$reg_sw_pid" 2>/dev/null || true)" ;; esac
-        if [ -n "$reg_sw_token" ] && [ "$reg_sw_live" = "$reg_sw_token" ]; then return 1; fi
-        rm -rf "$reg_sw_lock" 2>/dev/null || return 1
-        mkdir "$reg_sw_lock" 2>/dev/null || return 1
-    fi
-    printf '%s
-' "$$" >"$reg_sw_lock/pid" || { rm -rf "$reg_sw_lock"; return 1; }
-    reg_process_token "$$" >"$reg_sw_lock/process_token" 2>/dev/null || : >"$reg_sw_lock/process_token"
-    printf '%s
-' "$reg_sw_lock"
+    reg_lock_dir_acquire "$REG_LOCK_DIR/state-write.lock" state-write
 }
 
 reg_state_write_lock_release() {
-    reg_sw_lock="$1"
-    reg_sw_pid="$(cat "$reg_sw_lock/pid" 2>/dev/null || true)"
-    [ "$reg_sw_pid" = "$$" ] || return 1
-    rm -rf "$reg_sw_lock"
+    reg_lock_dir_release "$1"
 }
 
 reg_state_defaults() {
@@ -325,32 +380,20 @@ reg_lock_acquire() {
     reg_lock_owner="${2:-unknown}"
     reg_lock_path="$REG_LOCK_DIR/$reg_lock_name"
     reg_ensure_state || return 1
-    if mkdir "$reg_lock_path" 2>/dev/null; then :; else
-        reg_old_pid="$(cat "$reg_lock_path/pid" 2>/dev/null || true)"
-        reg_old_token="$(cat "$reg_lock_path/process_token" 2>/dev/null || true)"
-        reg_live_token=""
-        case "$reg_old_pid" in ''|*[!0-9]*) ;; *) reg_live_token="$(reg_process_token "$reg_old_pid" 2>/dev/null || true)" ;; esac
-        if [ -n "$reg_old_token" ] && [ "$reg_live_token" = "$reg_old_token" ]; then return 1; fi
-        rm -rf "$reg_lock_path" 2>/dev/null || return 1
-        mkdir "$reg_lock_path" 2>/dev/null || return 1
-    fi
-    printf '%s\n' "$$" >"$reg_lock_path/pid" || { rm -rf "$reg_lock_path"; return 1; }
-    reg_process_token "$$" >"$reg_lock_path/process_token" 2>/dev/null || : >"$reg_lock_path/process_token"
-    printf '%s\n' "$reg_lock_owner" >"$reg_lock_path/owner"
-    reg_now_epoch >"$reg_lock_path/acquired_epoch"
-    printf '%s\n' "$reg_lock_path"
+    reg_lock_dir_acquire "$reg_lock_path" "$reg_lock_owner"
 }
 
 reg_lock_release() {
-    reg_lock_path="$1"
-    reg_lock_pid="$(cat "$reg_lock_path/pid" 2>/dev/null || true)"
-    [ "$reg_lock_pid" = "$$" ] || return 1
-    rm -rf "$reg_lock_path"
+    reg_lock_dir_release "$1"
 }
 
 reg_pool_mtime_epoch() {
     reg_pool_path="$1"
     [ -n "$reg_pool_path" ] && [ -e "$reg_pool_path" ] || { echo 0; return 0; }
+    # Ranked aliases point through an atomic generation link; age the data,
+    # not the stable compatibility symlink created during first migration.
+    reg_pool_path="$(readlink -f "$reg_pool_path" 2>/dev/null || true)"
+    [ -n "$reg_pool_path" ] && [ -f "$reg_pool_path" ] || { echo 0; return 0; }
     reg_pool_value="$(stat -c %Y "$reg_pool_path" 2>/dev/null | head -n1)"
     printf '%s\n' "$reg_pool_value" | grep -Eq '^[0-9]+$' && { echo "$reg_pool_value"; return 0; }
     reg_pool_value="$(date -r "$reg_pool_path" +%s 2>/dev/null | head -n1)"
@@ -504,4 +547,3 @@ reg_request_full_refresh() {
     echo REQUESTED
     return 0
 }
-
