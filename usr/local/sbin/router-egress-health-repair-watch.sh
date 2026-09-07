@@ -20,6 +20,7 @@ LOG_KEEP_LINES="${HEALTH_REPAIR_LOG_KEEP_LINES:-200}"
 DISPATCHER="${RECOVERY_DISPATCHER:-/usr/local/sbin/router-egress-recovery-dispatcher.sh}"
 FULL_REFRESH_ORCHESTRATOR="${FULL_POOL_REFRESH_ORCHESTRATOR:-/usr/local/sbin/router-egress-full-pool-refresh.sh}"
 STATE_HELPER="${RECOVERY_STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}"
+HTTPS_ORACLE="${HTTPS_HEALTH_ORACLE:-/usr/local/lib/router-egress-https-health.sh}"
 
 ONCE=false
 FORCE_SLOT=""
@@ -43,6 +44,7 @@ case "$FAIL_THRESHOLD:$INTERVAL_SEC:$COOLDOWN_SEC:$LOG_MAX_BYTES:$LOG_KEEP_LINES
 [ -r "$SLOTS_CONF" ] || { echo "ERROR=slots_conf_missing:$SLOTS_CONF" >&2; exit 2; }
 [ -x "$DISPATCHER" ] || { echo "ERROR=dispatcher_missing:$DISPATCHER" >&2; exit 2; }
 [ -r "$STATE_HELPER" ] || { echo "ERROR=state_helper_missing:$STATE_HELPER" >&2; exit 2; }
+[ -x "$HTTPS_ORACLE" ] || { echo "ERROR=https_oracle_missing:$HTTPS_ORACLE" >&2; exit 2; }
 mkdir -p "$WATCH_STATE_DIR" "$(dirname "$LOG")" || exit 2
 
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
@@ -73,21 +75,10 @@ health_log_bound() {
     mv -f "$trim" "$LOG"
 }
 
-slot_ok() {
-    iface="$1"
-    targets="$2"
-    count="$3"
-    timeout="$4"
-    ip link show "$iface" >/dev/null 2>&1 || return 1
-    old_ifs="$IFS"; IFS=','
-    for target in $targets; do
-        IFS="$old_ifs"
-        [ -n "$target" ] || continue
-        ping -I "$iface" -c "$count" -W "$timeout" "$target" >/dev/null 2>&1 || return 1
-        IFS=','
-    done
-    IFS="$old_ifs"
-    return 0
+https_quorum_from_file() {
+    hq_file="$1"
+    hq="$(sed -n 's/.* quorum=\([0-9]\)\/3.*/\1/p' "$hq_file" 2>/dev/null | head -n1)"
+    case "$hq" in ''|*[!0-9]*) echo 0 ;; *) echo "$hq" ;; esac
 }
 
 run_once() {
@@ -95,11 +86,22 @@ run_once() {
     now="$(date +%s)"
     rows="/tmp/router-egress-health-rows.$$"
     json="/tmp/router-egress-health-json.$$"
-    trap 'rm -f "$rows" "$json"' EXIT HUP INT TERM
+    probes="/tmp/router-egress-health-probes.$$"
+    mkdir -p "$probes" || return 1
+    trap 'rm -f "$rows" "$json"; rm -rf "$probes"' EXIT HUP INT TERM
     grep -Ev '^[[:space:]]*(#|$)' "$SLOTS_CONF" >"$rows"
     : >"$json"
     first=true
     any_action=false
+
+    # One bounded health cycle: all five HTTPS oracles run concurrently.
+    while read -r p_slot p_iface p_table p_mark p_dscp p_provider p_adapter p_targets p_count p_timeout p_enabled p_rest; do
+        [ -n "${p_slot:-}" ] || continue
+        [ -z "$FORCE_SLOT" ] || [ "$p_slot" = "$FORCE_SLOT" ] || continue
+        [ "$p_enabled" = 1 ] || continue
+        "$HTTPS_ORACLE" --iface "$p_iface" >"$probes/$p_slot.out" 2>"$probes/$p_slot.err" &
+    done <"$rows"
+    wait || true
 
     while read -r slot iface table mark dscp provider adapter targets strict_count strict_timeout enabled rest; do
         [ -n "${slot:-}" ] || continue
@@ -125,7 +127,9 @@ run_once() {
         refresh_request_reason=""
         refresh_request_result=not_requested
 
-        if slot_ok "$iface" "$targets" "$strict_count" "$strict_timeout"; then
+        https_quorum="$(https_quorum_from_file "$probes/$slot.out")"
+        https_detail="$(cat "$probes/$slot.out" 2>/dev/null || true)"
+        if [ "$https_quorum" -ge "${HTTPS_HEALTH_SUCCESS_QUORUM:-2}" ]; then
             health_ok=true
             fail_count=0
             echo 0 >"$fail_file"
@@ -207,22 +211,22 @@ run_once() {
 
         $first || printf ',\n' >>"$json"
         first=false
-        printf '    {"slot":"%s","iface":"%s","health_ok":%s,"fail_count":%s,"decision":"%s","action":"%s","dispatcher_rc":%s,"required_confirm":"%s","adapter_reason":"%s","adapter_selected_pool":"%s","adapter_selected_pool_age_sec":%s,"adapter_available_candidate_count":%s,"candidate_endpoint":"%s","refresh_request_reason":"%s","refresh_request_result":"%s"}' \
-            "$(json_escape "$slot")" "$(json_escape "$iface")" "$health_ok" "$fail_count" \
+        printf '    {"slot":"%s","iface":"%s","health_ok":%s,"https_quorum":%s,"fail_count":%s,"decision":"%s","action":"%s","dispatcher_rc":%s,"required_confirm":"%s","adapter_reason":"%s","adapter_selected_pool":"%s","adapter_selected_pool_age_sec":%s,"adapter_available_candidate_count":%s,"candidate_endpoint":"%s","refresh_request_reason":"%s","refresh_request_result":"%s"}' \
+            "$(json_escape "$slot")" "$(json_escape "$iface")" "$health_ok" "$https_quorum" "$fail_count" \
             "$(json_escape "$decision")" "$(json_escape "$action")" "$dispatcher_rc" \
             "$(json_escape "$required_confirm")" "$(json_escape "$adapter_reason")" \
             "$(json_escape "$adapter_selected_pool")" "$adapter_selected_pool_age_sec" \
             "$adapter_available_candidate_count" "$(json_escape "$candidate_endpoint")" \
             "$(json_escape "$refresh_request_reason")" "$(json_escape "$refresh_request_result")" >>"$json"
-        printf '%s slot=%s iface=%s health_ok=%s fail_count=%s decision=%s action=%s dispatcher_rc=%s mode=%s adapter_reason=%s pool=%s pool_age_sec=%s candidate_count=%s candidate=%s refresh_request_reason=%s refresh_request_result=%s
+        printf '%s slot=%s iface=%s health_ok=%s https_quorum=%s fail_count=%s decision=%s action=%s dispatcher_rc=%s mode=%s adapter_reason=%s pool=%s pool_age_sec=%s candidate_count=%s candidate=%s refresh_request_reason=%s refresh_request_result=%s
 ' \
-            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$slot" "$iface" "$health_ok" "$fail_count" \
+            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$slot" "$iface" "$health_ok" "$https_quorum" "$fail_count" \
             "$decision" "$action" "$dispatcher_rc" "$MODE" "$adapter_reason" "$adapter_selected_pool" \
             "$adapter_selected_pool_age_sec" "$adapter_available_candidate_count" "$candidate_endpoint" \
             "$refresh_request_reason" "$refresh_request_result" >>"$LOG"
     done <"$rows"
 
-    printf '{\n  "schema":"router-egress-health-repair-watch-v4",\n  "mode":"%s",\n  "run_mode":"%s",\n  "any_action":%s,\n  "slots":[\n' \
+    printf '{\n  "schema":"router-egress-health-repair-watch-v5",\n  "mode":"%s",\n  "run_mode":"%s",\n  "any_action":%s,\n  "slots":[\n' \
         "$(json_escape "$MODE")" "$RUN_MODE" "$any_action"
     cat "$json"
     printf '\n  ]\n}\n'

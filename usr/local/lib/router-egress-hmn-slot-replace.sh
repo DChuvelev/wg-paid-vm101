@@ -38,6 +38,8 @@ IFDOWN_BIN="${IFDOWN_BIN:-ifdown}"
 SLEEP_BIN="${SLEEP_BIN:-sleep}"
 AWG_BIN="${AWG_BIN:-/usr/bin/amneziawg}"
 SHA256_BIN="${SHA256_BIN:-sha256sum}"
+HTTPS_ORACLE="${HTTPS_HEALTH_ORACLE:-/usr/local/lib/router-egress-https-health.sh}"
+IDENTITY_BIN="${HMN_TUNNEL_IDENTITY:-/usr/local/lib/router-egress-hmn-identity.sh}"
 
 mkdir -p "$STATE_DIR" "$(dirname "$LOG")" 2>/dev/null || true
 
@@ -193,17 +195,21 @@ binding_matches() (
     printf 'binding_match=%s\n' "$bm_ok" >>"$bm_out"
     [ "$bm_ok" = true ]
 )
-strict_ping() (
-    sp_iface="$1"; sp_targets="$2"; sp_count="$3"; sp_timeout="$4"; sp_oldifs="$IFS"; IFS=','
-    for sp_target in $sp_targets; do
-        IFS="$sp_oldifs"; [ -n "$sp_target" ] || continue
-        sp_out="/tmp/router-egress-repair-ping.$$.out"; sp_err="/tmp/router-egress-repair-ping.$$.err"
-        if ! "$PING_BIN" -I "$sp_iface" -c "$sp_count" -W "$sp_timeout" "$sp_target" >"$sp_out" 2>"$sp_err"; then rm -f "$sp_out" "$sp_err"; exit 1; fi
-        sp_received="$(grep -Eo '[0-9]+ packets received' "$sp_out" 2>/dev/null | awk '{print $1}' | tail -1)"
-        if [ -n "$sp_received" ] && [ "$sp_received" != "$sp_count" ]; then rm -f "$sp_out" "$sp_err"; exit 1; fi
-        rm -f "$sp_out" "$sp_err"; IFS=','
-    done
-    IFS="$sp_oldifs"
+strict_https() (
+    sh_iface="$1"
+    [ -x "$HTTPS_ORACLE" ] || exit 1
+    "$HTTPS_ORACLE" --iface "$sh_iface" >/dev/null 2>&1
+)
+pool_candidate_pairs() (
+    pc_file="$1"
+    awk -F '\t' 'NR>1 {
+        ep=""; path=""
+        for(i=1;i<=NF;i++){
+            if($i ~ /^([A-Za-z0-9._-]+\.[A-Za-z]{2,}|[0-9]{1,3}(\.[0-9]{1,3}){3}):[0-9]{2,5}$/) ep=$i
+            if($i ~ /^\// && $i ~ /\.conf$/) path=$i
+        }
+        if(ep!="" && path!="") print ep "\t" path
+    }' "$pc_file"
 )
 
 write_result() {
@@ -273,6 +279,8 @@ refuse_json() { printf '{"schema":"router-egress-hmn-slot-replace-v4","decision"
 [ -r "$SLOTS_CONF" ] || refuse_json slots_conf_missing
 [ -r "$STATE_HELPER" ] || refuse_json state_helper_missing
 [ -r "$NETWORK_CONFIG" ] || refuse_json network_config_missing
+[ -x "$HTTPS_ORACLE" ] || refuse_json https_oracle_missing
+[ -x "$IDENTITY_BIN" ] || refuse_json identity_helper_missing
 . "$STATE_HELPER"
 reg_init_state >/dev/null 2>&1 || refuse_json state_init_failed
 operation_lock=''; operation_lock_owned=false
@@ -292,27 +300,52 @@ if [ "$MODE" = '--commit' ] && [ "${ROUTER_EGRESS_LOCAL_REPAIR_LOCK_HELD:-0}" !=
     operation_lock="${REG_LOCK_DIR}/local-repair.lock"; mkdir "$operation_lock" 2>/dev/null || refuse_json local_repair_lock_busy; operation_lock_owned=true
 fi
 : >"$used_file"
-for active_iface in vpn1 vpn2 vpn3 vpn4 vpn5; do active_endpoint="$(current_endpoint_for_iface "$active_iface")"; [ -z "$active_endpoint" ] || printf '%s\n' "$active_endpoint" >>"$used_file"; done
+for active_iface in vpn1 vpn2 vpn3 vpn4 vpn5; do
+    active_cfg="$("$UCI_BIN" -q get "network.${active_iface}.hmn_source_config" 2>/dev/null || true)"
+    active_id=""
+    [ -r "$active_cfg" ] && active_id="$("$IDENTITY_BIN" "$active_cfg" 2>/dev/null || true)"
+    if [ -n "$active_id" ]; then
+        printf 'id:%s\n' "$active_id" >>"$used_file"
+    else
+        active_endpoint="$(current_endpoint_for_iface "$active_iface")"
+        [ -z "$active_endpoint" ] || printf 'ep:%s\n' "$active_endpoint" >>"$used_file"
+    fi
+done
 sort -u "$used_file" -o "$used_file"
 selected_pool=''; selected_pool_age_sec=999999999; selected_pool_endpoint_count=0; preferred_pool_scan_count=0; nonempty_pool_count=0; stale_pool_count=0; fresh_pool_count=0; fresh_pool_without_candidate_count=0; candidate_config_missing_count=0; first_nonempty_pool=''; first_nonempty_pool_age_sec=999999999; pool_is_fresh=false; candidate_count=0; candidate=''; candidate_config=''; candidate_config_sha256=''
 for name in $PREFERRED_POOL_FILES; do
-    preferred_pool_scan_count=$((preferred_pool_scan_count+1)); file="${HMN_CACHE_DIR}/${name}"; [ -s "$file" ] || continue
-    count="$(endpoint_count "$file")"; [ "$count" -gt 0 ] || continue; nonempty_pool_count=$((nonempty_pool_count+1))
+    preferred_pool_scan_count=$((preferred_pool_scan_count+1))
+    file="${HMN_CACHE_DIR}/${name}"
+    [ -s "$file" ] || continue
+    pool_candidate_pairs "$file" >"$pool_file"
+    count="$(wc -l <"$pool_file" | tr -d ' ')"
+    [ "$count" -gt 0 ] || continue
+    nonempty_pool_count=$((nonempty_pool_count+1))
     mtime="$(reg_pool_mtime_epoch "$file")"; [ -n "$mtime" ] || mtime=0; age=$((now-mtime))
     if [ -z "$first_nonempty_pool" ]; then first_nonempty_pool="$file"; first_nonempty_pool_age_sec="$age"; fi
     if [ "$age" -lt 0 ] || [ "$age" -gt "$MAX_POOL_AGE_SEC" ]; then stale_pool_count=$((stale_pool_count+1)); continue; fi
-    fresh_pool_count=$((fresh_pool_count+1)); extract_endpoints "$file" >"$pool_file"; : >"$candidate_file"
-    while IFS= read -r endpoint; do
-        [ -n "$endpoint" ] || continue; grep -Fx "$endpoint" "$used_file" >/dev/null 2>&1 && continue; reg_endpoint_quarantined_for_pool "$endpoint" "$file" && continue
-        cfg="$(find_config_for_endpoint "$endpoint" "$file" 2>/dev/null || true)"
-        if [ -z "$cfg" ] || ! config_binding_valid "$cfg" "$endpoint"; then candidate_config_missing_count=$((candidate_config_missing_count+1)); continue; fi
+    fresh_pool_count=$((fresh_pool_count+1)); : >"$candidate_file"
+    while IFS="$(printf '\t')" read -r endpoint cfg; do
+        [ -n "$endpoint" ] && [ -n "$cfg" ] || continue
+        reg_endpoint_quarantined_for_pool "$endpoint" "$file" && continue
+        if [ ! -f "$cfg" ] || ! config_binding_valid "$cfg" "$endpoint"; then candidate_config_missing_count=$((candidate_config_missing_count+1)); continue; fi
+        candidate_id="$("$IDENTITY_BIN" "$cfg" 2>/dev/null || true)"
+        [ -n "$candidate_id" ] || { candidate_config_missing_count=$((candidate_config_missing_count+1)); continue; }
+        grep -Fx "id:$candidate_id" "$used_file" >/dev/null 2>&1 && continue
+        # Conservative fallback only for an active slot whose source config is unavailable.
+        grep -Fx "ep:$endpoint" "$used_file" >/dev/null 2>&1 && continue
         printf '%s\t%s\n' "$endpoint" "$cfg" >>"$candidate_file"
     done <"$pool_file"
-    candidate_count="$(wc -l <"$candidate_file" | tr -d ' ')"; candidate="$(awk -F '\t' 'NR==1{print $1}' "$candidate_file")"; candidate_config="$(awk -F '\t' 'NR==1{print $2}' "$candidate_file")"
-    if [ "$candidate_count" -gt 0 ] && [ -n "$candidate" ] && [ -n "$candidate_config" ]; then selected_pool="$file"; selected_pool_age_sec="$age"; selected_pool_endpoint_count="$count"; pool_is_fresh=true; candidate_config_sha256="$("$SHA256_BIN" "$candidate_config" | awk '{print $1}')"; break; fi
+    candidate_count="$(wc -l <"$candidate_file" | tr -d ' ')"
+    candidate="$(awk -F '\t' 'NR==1{print $1}' "$candidate_file")"
+    candidate_config="$(awk -F '\t' 'NR==1{print $2}' "$candidate_file")"
+    if [ "$candidate_count" -gt 0 ] && [ -n "$candidate" ] && [ -n "$candidate_config" ]; then
+        selected_pool="$file"; selected_pool_age_sec="$age"; selected_pool_endpoint_count="$count"; pool_is_fresh=true
+        candidate_config_sha256="$("$SHA256_BIN" "$candidate_config" | awk '{print $1}')"
+        break
+    fi
     fresh_pool_without_candidate_count=$((fresh_pool_without_candidate_count+1)); candidate_count=0; candidate=''; candidate_config=''
 done
-
 decision=refuse; reason=unknown; apply_performed=false; apply_rc=0; post_strict_ok=false; binding_consistency_ok=false; metadata_endpoint_after_apply=''; peer_uci_endpoint_after_apply=''; live_endpoint_after_apply=''; endpoint_consistency_ok=false; apply_mechanism_failed=false; rollback_performed=false; rollback_ok=false; rollback_file=''; candidate_attempts=0
 if [ -z "$selected_pool" ] && [ "$nonempty_pool_count" -eq 0 ]; then reason=no_pool_file
 elif [ -z "$selected_pool" ] && [ "$fresh_pool_count" -eq 0 ]; then reason=stale_pool
@@ -353,7 +386,7 @@ EOF_ROLLBACK
             metadata_endpoint_after_apply="$("$UCI_BIN" -q get "network.${iface}.hmn_endpoint" 2>/dev/null || true)"; peer_uci_endpoint_after_apply="$(peer_uci_endpoint_for_iface "$iface")"; live_endpoint_after_apply="$(live_endpoint_for_iface "$iface")"; endpoint_consistency_ok=false
             if [ "$binding_consistency_ok" = true ] && [ "$metadata_endpoint_after_apply" = "$candidate" ] && [ "$peer_uci_endpoint_after_apply" = "$candidate" ] && [ "$live_endpoint_after_apply" = "$candidate" ]; then endpoint_consistency_ok=true; fi
             if [ "$apply_rc" -ne 0 ] || [ "$binding_consistency_ok" != true ] || [ "$endpoint_consistency_ok" != true ]; then apply_mechanism_failed=true; reason=candidate_full_config_not_applied; break; fi
-            if "$IP_BIN" link show "$iface" >/dev/null 2>&1 && "$IP_BIN" route show table "$table" 2>/dev/null | grep -Eq "default[[:space:]].*dev[[:space:]]+${iface}([[:space:]]|$)" && strict_ping "$iface" "$health_targets" "$strict_count" "$strict_timeout"; then decision=commit_ok; reason=candidate_full_config_applied_live_verified_and_strict_ok; post_strict_ok=true; break; fi
+            if "$IP_BIN" link show "$iface" >/dev/null 2>&1 && "$IP_BIN" route show table "$table" 2>/dev/null | grep -Eq "default[[:space:]].*dev[[:space:]]+${iface}([[:space:]]|$)" && strict_https "$iface"; then decision=commit_ok; reason=candidate_full_config_applied_live_verified_and_https_ok; post_strict_ok=true; break; fi
             reg_quarantine_endpoint "$candidate" "$SLOT" "$iface" '' repair_candidate_failed "$selected_pool" STEP_050M07R20L_FULL_CANDIDATE_CONFIG_BINDING >/dev/null 2>&1 || true
         done <"$candidate_file"
         if [ "$decision" != commit_ok ]; then

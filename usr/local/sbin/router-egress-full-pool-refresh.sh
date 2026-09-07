@@ -300,44 +300,19 @@ for candidate in "$PROVIDER_ROOT"/test-runs/*/results.tsv; do
 done
 [ -n "$RESULTS" ] && [ -s "$RESULTS" ] || fail STOP_R20C_PROVIDER_RESULTS_MISSING provider_results provider_test_failure
 
-echo ">>> [R20C] adapt tester results to provider ranker v1 schema"
-EXPECTED_RESULTS_HEADER='status	file	endpoint	latest_handshake	transfer	ping_loss	ping_rtt_avg	show_file	ping_file'
+echo ">>> [R20C] validate provider quality results schema"
+PROVIDER_RESULTS_SCHEMA_ADAPTER=true
+EXPECTED_RESULTS_HEADER='status	file	endpoint	tunnel_id	active_iface	https_quorum	https_google	https_cloudflare	https_mozilla	ping_loss	ping_rtt_avg	throughput_bps	config_path	show_file	detail_file'
 [ "$(head -n1 "$RESULTS")" = "$EXPECTED_RESULTS_HEADER" ] || fail STOP_R20C_PROVIDER_RESULTS_SCHEMA_HEADER provider_results_header provider_schema_adapter_failure
-RANK_RESULTS="$RUN_DIR/provider-results-ranker-v1.tsv"
-if ! awk -F '\t' 'BEGIN { OFS="\t" }
-    NR == 1 { print; next }
-    NF < 7 { bad=1; next }
-    $1 == "OK" {
-        loss=$6
-        all_zero=(loss == "0%")
-        if (!all_zero) {
-            n=split(loss, parts, ",")
-            all_zero=(n > 0)
-            for (i=1; i<=n; i++) {
-                if (parts[i] !~ /^[^,:[:space:]]+:0%$/) all_zero=0
-            }
-        }
-        if (!all_zero) { bad=1; next }
-        $6="0%"
-    }
-    { print }
-    END { if (bad) exit 1 }
-' "$RESULTS" >"$RANK_RESULTS"; then
-    fail STOP_R20C_PROVIDER_RESULTS_SCHEMA_ADAPTER provider_results_adapter provider_schema_adapter_failure
-fi
-chmod 600 "$RANK_RESULTS"
-ORIGINAL_OK_COUNT="$(awk -F '\t' 'NR>1 && $1=="OK" {n++} END {print n+0}' "$RESULTS")"
-ADAPTED_OK_COUNT="$(awk -F '\t' 'NR>1 && $1=="OK" && $6=="0%" {n++} END {print n+0}' "$RANK_RESULTS")"
-[ "$ORIGINAL_OK_COUNT" = "$ADAPTED_OK_COUNT" ] || fail STOP_R20C_PROVIDER_RESULTS_SCHEMA_COUNT provider_results_count provider_schema_adapter_failure
+RANK_RESULTS="$RESULTS"
+ADAPTED_OK_COUNT="$(awk -F '\t' 'NR>1 && $1=="OK" && $6 ~ /^[23]\/3$/ && $12 ~ /^[0-9.]+$/ && $12+0>0 {n++} END {print n+0}' "$RESULTS")"
 [ "$ADAPTED_OK_COUNT" -ge 5 ] || fail STOP_R20C_PROVIDER_RESULTS_INSUFFICIENT_OK provider_results_ok_count insufficient_healthy_candidates
 cat >"$RUN_DIR/logs/provider-results-adapter.log" <<EOF
-RESULT=PASS_R18_PROVIDER_RESULTS_SCHEMA_ADAPTED
-ORIGINAL_RESULTS=$RESULTS
-ADAPTED_RESULTS=$RANK_RESULTS
-ORIGINAL_OK_COUNT=$ORIGINAL_OK_COUNT
-ADAPTED_OK_COUNT=$ADAPTED_OK_COUNT
-SOURCE_SCHEMA=hmn-test-results-v9-composite-loss
-TARGET_SCHEMA=hmn-ranker-v1-single-loss
+RESULT=PASS_R20_PROVIDER_RESULTS_SCHEMA_V10
+RESULTS=$RESULTS
+OK_COUNT=$ADAPTED_OK_COUNT
+SOURCE_SCHEMA=hmn-test-results-v10-https-rtt-throughput
+TARGET_SCHEMA=hmn-ranker-v2-quality
 EOF
 
 echo ">>> [R20C] provider ranking"
