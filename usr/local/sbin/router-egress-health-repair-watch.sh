@@ -21,6 +21,10 @@ DISPATCHER="${RECOVERY_DISPATCHER:-/usr/local/sbin/router-egress-recovery-dispat
 FULL_REFRESH_ORCHESTRATOR="${FULL_POOL_REFRESH_ORCHESTRATOR:-/usr/local/sbin/router-egress-full-pool-refresh.sh}"
 STATE_HELPER="${RECOVERY_STATE_HELPER:-/usr/local/lib/router-egress-recovery-state.sh}"
 HTTPS_ORACLE="${HTTPS_HEALTH_ORACLE:-/usr/local/lib/router-egress-https-health.sh}"
+IDENTITY_HELPER="${HMN_IDENTITY_HELPER:-/usr/local/lib/router-egress-hmn-identity.sh}"
+UCI_BIN="${UCI_BIN:-uci}"
+HEARTBEAT_SEC="${HEALTH_REPAIR_LOG_HEARTBEAT_SEC:-600}"
+HEARTBEAT_FILE="$WATCH_STATE_DIR/event-heartbeat-epoch"
 
 ONCE=false
 FORCE_SLOT=""
@@ -38,9 +42,10 @@ while [ "$#" -gt 0 ]; do
 done
 
 case "$MODE" in --dry-run|--commit) ;; *) echo "ERROR=invalid_mode:$MODE" >&2; exit 2 ;; esac
-case "$FAIL_THRESHOLD:$INTERVAL_SEC:$COOLDOWN_SEC:$LOG_MAX_BYTES:$LOG_KEEP_LINES" in *[!0-9:]*) echo 'ERROR=invalid_numeric_configuration' >&2; exit 2 ;; esac
+case "$FAIL_THRESHOLD:$INTERVAL_SEC:$COOLDOWN_SEC:$LOG_MAX_BYTES:$LOG_KEEP_LINES:$HEARTBEAT_SEC" in *[!0-9:]*) echo 'ERROR=invalid_numeric_configuration' >&2; exit 2 ;; esac
 [ "$LOG_MAX_BYTES" -ge 65536 ] || { echo 'ERROR=health_log_max_bytes_too_small' >&2; exit 2; }
 [ "$LOG_KEEP_LINES" -ge 20 ] || { echo 'ERROR=health_log_keep_lines_too_small' >&2; exit 2; }
+[ "$HEARTBEAT_SEC" -ge 60 ] || { echo 'ERROR=health_log_heartbeat_too_small' >&2; exit 2; }
 [ -r "$SLOTS_CONF" ] || { echo "ERROR=slots_conf_missing:$SLOTS_CONF" >&2; exit 2; }
 [ -x "$DISPATCHER" ] || { echo "ERROR=dispatcher_missing:$DISPATCHER" >&2; exit 2; }
 [ -r "$STATE_HELPER" ] || { echo "ERROR=state_helper_missing:$STATE_HELPER" >&2; exit 2; }
@@ -49,6 +54,38 @@ mkdir -p "$WATCH_STATE_DIR" "$(dirname "$LOG")" || exit 2
 
 json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
 uint_or_zero() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+
+event_emit() {
+    ev="$1"; shift
+    printf '%s event=%s' "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$ev" >>"$LOG"
+    for kv in "$@"; do printf ' %s' "$kv" >>"$LOG"; done
+    printf '
+' >>"$LOG"
+}
+
+slot_metadata() {
+    sm_iface="$1"
+    sm_cfg=''; sm_endpoint=''; sm_identity=''
+    if command -v "$UCI_BIN" >/dev/null 2>&1; then
+        sm_cfg="$($UCI_BIN -q get "network.${sm_iface}.hmn_source_config" 2>/dev/null || true)"
+        sm_endpoint="$($UCI_BIN -q get "network.${sm_iface}.hmn_endpoint" 2>/dev/null || true)"
+    fi
+    if [ -n "$sm_cfg" ] && [ -r "$sm_cfg" ] && [ -x "$IDENTITY_HELPER" ]; then
+        sm_identity="$($IDENTITY_HELPER "$sm_cfg" 2>/dev/null || true)"
+    fi
+    [ -n "$sm_identity" ] || sm_identity=unknown
+    [ -n "$sm_endpoint" ] || sm_endpoint=unknown
+}
+
+probe_metadata() {
+    pm_file="$1"
+    pm_google="$(sed -n 's/.* google=\([^ ]*\).*/\1/p' "$pm_file" 2>/dev/null | head -n1)"
+    pm_cloudflare="$(sed -n 's/.* cloudflare=\([^ ]*\).*/\1/p' "$pm_file" 2>/dev/null | head -n1)"
+    pm_mozilla="$(sed -n 's/.* mozilla=\([^ ]*\).*/\1/p' "$pm_file" 2>/dev/null | head -n1)"
+    [ -n "$pm_google" ] || pm_google=missing
+    [ -n "$pm_cloudflare" ] || pm_cloudflare=missing
+    [ -n "$pm_mozilla" ] || pm_mozilla=missing
+}
 
 health_log_bound() {
     [ -f "$LOG" ] || return 0
@@ -93,6 +130,8 @@ run_once() {
     : >"$json"
     first=true
     any_action=false
+    cycle_total=0
+    cycle_healthy=0
 
     # One bounded health cycle: all five HTTPS oracles run concurrently.
     while read -r p_slot p_iface p_table p_mark p_dscp p_provider p_adapter p_targets p_count p_timeout p_enabled p_rest; do
@@ -113,6 +152,7 @@ run_once() {
         fail_file="$WATCH_STATE_DIR/fail-$slot"
         cooldown_file="$WATCH_STATE_DIR/cooldown-$slot"
         fail_count="$(uint_or_zero "$(cat "$fail_file" 2>/dev/null || true)")"
+        previous_fail_count="$fail_count"
         cooldown_until="$(uint_or_zero "$(cat "$cooldown_file" 2>/dev/null || true)")"
         health_ok=false
         decision=none
@@ -129,18 +169,34 @@ run_once() {
 
         https_quorum="$(https_quorum_from_file "$probes/$slot.out")"
         https_detail="$(cat "$probes/$slot.out" 2>/dev/null || true)"
+        slot_metadata "$iface"
+        probe_metadata "$probes/$slot.out"
+        cycle_total=$((cycle_total + 1))
         if [ "$https_quorum" -ge "${HTTPS_HEALTH_SUCCESS_QUORUM:-2}" ]; then
             health_ok=true
+            cycle_healthy=$((cycle_healthy + 1))
             fail_count=0
             echo 0 >"$fail_file"
             decision=healthy
+            if [ "$previous_fail_count" -gt 0 ]; then
+                event_emit health_recovered "slot=$slot" "iface=$iface" "identity=$sm_identity" "endpoint=$sm_endpoint"                     "previous_fail_count=$previous_fail_count" "https_quorum=$https_quorum/3"                     "google=$pm_google" "cloudflare=$pm_cloudflare" "mozilla=$pm_mozilla"
+            fi
         else
             fail_count=$((fail_count + 1))
             echo "$fail_count" >"$fail_file"
+            if [ "$fail_count" -eq 1 ]; then
+                event_emit health_fail_first "slot=$slot" "iface=$iface" "identity=$sm_identity" "endpoint=$sm_endpoint"                     "https_quorum=$https_quorum/3" "fail_count=$fail_count"                     "google=$pm_google" "cloudflare=$pm_cloudflare" "mozilla=$pm_mozilla"
+            fi
+            if [ "$fail_count" -eq "$FAIL_THRESHOLD" ]; then
+                event_emit health_fail_threshold "slot=$slot" "iface=$iface" "identity=$sm_identity" "endpoint=$sm_endpoint"                     "https_quorum=$https_quorum/3" "fail_count=$fail_count"
+            fi
             if [ "$fail_count" -lt "$FAIL_THRESHOLD" ]; then
                 decision=fail_observed_below_threshold
             elif [ "$now" -lt "$cooldown_until" ]; then
                 decision=cooldown
+                if [ "$fail_count" -eq "$FAIL_THRESHOLD" ]; then
+                    event_emit repair_suppressed_cooldown "slot=$slot" "iface=$iface" "identity=$sm_identity"                         "endpoint=$sm_endpoint" "cooldown_until=$cooldown_until"
+                fi
             else
                 dry_out="/tmp/router-egress-health-dry-${slot}.$$"
                 dry_err="/tmp/router-egress-health-dry-${slot}.$$.err"
@@ -155,7 +211,6 @@ run_once() {
                 candidate_endpoint="$(sed -n 's/.*"candidate_endpoint": "\([^"]*\)".*/\1/p' "$dry_out" | head -n1)"
                 case "$adapter_selected_pool_age_sec" in ''|*[!0-9]*) adapter_selected_pool_age_sec=0 ;; esac
                 case "$adapter_available_candidate_count" in ''|*[!0-9]*) adapter_available_candidate_count=0 ;; esac
-                cat "$dry_err" >>"$LOG" 2>/dev/null || true
 
                 if [ "$dry_rc" -eq 0 ] && [ "$dry_decision" = dry_run_ok ] && [ "$MODE" = --commit ] && [ -n "$required_confirm" ]; then
                     commit_out="/tmp/router-egress-health-commit-${slot}.$$"
@@ -187,7 +242,13 @@ run_once() {
                         echo 0 >"$fail_file"
                         fail_count=0
                     fi
-                    cat "$commit_err" >>"$LOG" 2>/dev/null || true
+                    if [ "$action" = commit_deferred_lock_busy ]; then
+                        event_emit repair_deferred_lock_busy "slot=$slot" "iface=$iface" "identity=$sm_identity"                             "endpoint=$sm_endpoint" "candidate=$candidate_endpoint" "dispatcher_rc=$dispatcher_rc"
+                    elif [ "$dispatcher_rc" -eq 0 ] && [ "$decision" = commit_ok ]; then
+                        event_emit repair_success "slot=$slot" "iface=$iface" "old_identity=$sm_identity"                             "old_endpoint=$sm_endpoint" "candidate=$candidate_endpoint" "https_quorum=$https_quorum/3"
+                    else
+                        event_emit repair_failed "slot=$slot" "iface=$iface" "identity=$sm_identity"                             "endpoint=$sm_endpoint" "candidate=$candidate_endpoint" "dispatcher_rc=$dispatcher_rc"                             "decision=$decision" "adapter_reason=${adapter_reason:-none}"
+                    fi
                     rm -f "$commit_out" "$commit_err"
                 else
                     dispatcher_rc="$dry_rc"
@@ -205,9 +266,11 @@ run_once() {
                                 if [ "$refresh_request_rc" -eq 0 ]; then
                                     action=request_full_refresh
                                     any_action=true
+                                    event_emit full_refresh_requested "slot=$slot" "iface=$iface" "identity=$sm_identity"                                         "endpoint=$sm_endpoint" "reason=$adapter_reason" "result=$refresh_request_result"
                                 else
                                     [ -n "$refresh_request_result" ] || refresh_request_result=ERROR_UNKNOWN
                                     action=request_full_refresh_failed
+                                    event_emit full_refresh_request_failed "slot=$slot" "iface=$iface" "identity=$sm_identity"                                         "endpoint=$sm_endpoint" "reason=$adapter_reason" "result=$refresh_request_result"
                                 fi
                                 ;;
                         esac
@@ -226,15 +289,17 @@ run_once() {
             "$(json_escape "$adapter_selected_pool")" "$adapter_selected_pool_age_sec" \
             "$adapter_available_candidate_count" "$(json_escape "$candidate_endpoint")" \
             "$(json_escape "$refresh_request_reason")" "$(json_escape "$refresh_request_result")" >>"$json"
-        printf '%s slot=%s iface=%s health_ok=%s https_quorum=%s fail_count=%s decision=%s action=%s dispatcher_rc=%s mode=%s adapter_reason=%s pool=%s pool_age_sec=%s candidate_count=%s candidate=%s refresh_request_reason=%s refresh_request_result=%s
-' \
-            "$(date -u '+%Y-%m-%dT%H:%M:%SZ')" "$slot" "$iface" "$health_ok" "$https_quorum" "$fail_count" \
-            "$decision" "$action" "$dispatcher_rc" "$MODE" "$adapter_reason" "$adapter_selected_pool" \
-            "$adapter_selected_pool_age_sec" "$adapter_available_candidate_count" "$candidate_endpoint" \
-            "$refresh_request_reason" "$refresh_request_result" >>"$LOG"
     done <"$rows"
 
-    printf '{\n  "schema":"router-egress-health-repair-watch-v5",\n  "mode":"%s",\n  "run_mode":"%s",\n  "any_action":%s,\n  "slots":[\n' \
+    if [ "$cycle_total" -gt 0 ] && [ "$cycle_healthy" -eq "$cycle_total" ]; then
+        last_heartbeat="$(uint_or_zero "$(cat "$HEARTBEAT_FILE" 2>/dev/null || true)")"
+        if [ $((now - last_heartbeat)) -ge "$HEARTBEAT_SEC" ]; then
+            event_emit heartbeat "all_healthy=true" "healthy_slots=$cycle_healthy/$cycle_total" "mode=$MODE"
+            printf '%s\n' "$now" >"$HEARTBEAT_FILE"
+        fi
+    fi
+
+    printf '{\n  "schema":"router-egress-health-repair-watch-v6",\n  "mode":"%s",\n  "run_mode":"%s",\n  "any_action":%s,\n  "slots":[\n' \
         "$(json_escape "$MODE")" "$RUN_MODE" "$any_action"
     cat "$json"
     printf '\n  ]\n}\n'
