@@ -41,6 +41,12 @@ mapper_apply() {
     printf 'add chain inet %s prerouting { type filter hook prerouting priority mangle; policy accept; }\n' "$TABLE" >> "$mapper_batch"
     printf 'add chain inet %s postrouting { type filter hook postrouting priority mangle; policy accept; }\n' "$TABLE" >> "$mapper_batch"
 
+    # Client SMTP submission cannot traverse the provider VPN exits.
+    # All VPN-transit clients arriving from VM100 share this hop; leave these
+    # packets unmarked so normal main-table routing uses MGTS Direct/eth0.
+    printf 'add rule inet %s prerouting iifname "%s" ip saddr %s tcp dport { 465, 587 } counter return comment "WGPay-SMTP-Submission-Direct"\n' \
+        "$TABLE" "$INPUT_IFACE" "$INPUT_SOURCE" >> "$mapper_batch"
+
     mapper_fallback_selectors=''
     for mapper_selector in cs1 cs2 cs3 cs4 cs5; do
         mapper_canonical_slot="$(rwf_selector_slot "$mapper_rows" "$mapper_selector")" || return 73
@@ -75,6 +81,11 @@ mapper_apply() {
     fi
     "$NFT_BIN" -f "$mapper_batch" || { echo 'RESULT=STOP_FALLBACK_NFT_TRANSACTION'; return 78; }
     "$NFT_BIN" list table inet "$TABLE" > "$mapper_dump" 2>&1 || { echo 'RESULT=STOP_FALLBACK_NFT_VERIFY_LIST'; return 79; }
+    grep -E 'iifname "?'"$INPUT_IFACE"'"?[[:space:]]+ip saddr '"$INPUT_SOURCE"'[[:space:]]+tcp dport \{ 465, 587 \}.*return.*WGPay-SMTP-Submission-Direct' "$mapper_dump" >/dev/null 2>&1 \
+        || { echo 'RESULT=STOP_SMTP_DIRECT_NFT_VERIFY'; return 83; }
+    grep -E 'tcp dport .*25.*WGPay-SMTP-Submission-Direct' "$mapper_dump" >/dev/null 2>&1 \
+        && { echo 'RESULT=STOP_SMTP_DIRECT_PORT25_PRESENT'; return 84; }
+
     mapper_seen=0
     for mapper_selector in cs1 cs2 cs3 cs4 cs5; do
         if [ "$mapper_state_mode" = persisted ]; then
@@ -95,6 +106,8 @@ mapper_apply() {
         'RESULT=PASS_VM101_ALWAYS_ON_FALLBACK_MAPPER_APPLY' \
         "MAPPER_STATE_MODE=${mapper_state_mode}" \
         "FALLBACK_SELECTORS=${mapper_fallback_selectors}" \
+        'SMTP_DIRECT_RULE_COUNT=1' \
+        'SMTP_DIRECT_PORTS=465,587' \
         'MAPPER_RULE_COUNT=5' \
         'CLEAR_RULE_COUNT=5' \
         'NFT_TRANSACTION_ATOMIC=true'
