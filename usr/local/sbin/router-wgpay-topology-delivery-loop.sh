@@ -9,5 +9,6 @@ case "$INTERVAL" in ''|*[!0-9]*) exit 64 ;; esac
 [ "$INTERVAL" -ge 1 ] || exit 64
 while :; do
     /usr/local/sbin/router-wgpay-topology-outbox.sh --run-once || true
+    /usr/local/sbin/router-wgpay-exit-catalog-publish.sh --run-once || true
     sleep "$INTERVAL"
 done
