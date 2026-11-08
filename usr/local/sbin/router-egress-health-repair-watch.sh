@@ -25,6 +25,17 @@ IDENTITY_HELPER="${HMN_IDENTITY_HELPER:-/usr/local/lib/router-egress-hmn-identit
 UCI_BIN="${UCI_BIN:-uci}"
 HEARTBEAT_SEC="${HEALTH_REPAIR_LOG_HEARTBEAT_SEC:-600}"
 HEARTBEAT_FILE="$WATCH_STATE_DIR/event-heartbeat-epoch"
+# A slot excluded during a failed repair must not remain permanently excluded
+# after its own VPN path has become demonstrably healthy again.
+TOPOLOGY_SYNC="${ROUTER_WGPAY_WATCHER_SYNC:-/usr/local/sbin/router-wgpay-watcher-topology-sync.sh}"
+TOPOLOGY_SLOTS_STATUS="${ROUTER_WGPAY_SLOTS_STATUS:-/usr/local/sbin/router-egress-slots-status.sh}"
+TOPOLOGY_FALLBACK="${ROUTER_WGPAY_FALLBACK_STATE:-/etc/router-wgpay-fallback/state.kv}"
+TOPOLOGY_WATCHER="${ROUTER_WGPAY_TOPOLOGY_STATE:-/etc/router-wgpay-watcher-topology/state.kv}"
+TOPOLOGY_DIRECT="${ROUTER_WGPAY_DIRECT_STATE:-/etc/router-wgpay-direct/state.kv}"
+TOPOLOGY_DELIVERY="${ROUTER_WGPAY_DELIVERY_STATE:-/etc/router-wgpay-topology-delivery/state.kv}"
+TOPOLOGY_STABLE_CYCLES="${TOPOLOGY_STABLE_CYCLES:-12}"
+TOPOLOGY_STABLE_SECONDS="${TOPOLOGY_STABLE_SECONDS:-100}"
+TOPOLOGY_MAX_GAP_SECONDS="${TOPOLOGY_MAX_GAP_SECONDS:-30}"
 
 ONCE=false
 FORCE_SLOT=""
@@ -118,6 +129,78 @@ https_quorum_from_file() {
     case "$hq" in ''|*[!0-9]*) echo 0 ;; *) echo "$hq" ;; esac
 }
 
+# An isolated subshell prevents the global ash variables in the state/lock
+# helpers from overwriting run_once's current slot and oracle results.
+# This is called only in the production watcher (--commit), never in dry-run.
+topology_stable_health_step() (
+    ts_slot="$1"; ts_healthy="$2"; ts_quorum="$3"; ts_now="$4"
+    case "$ts_slot" in egress[1-5]) ;; *) return 0 ;; esac
+    [ "$MODE" = --commit ] || return 0
+    ts_streak="$WATCH_STATE_DIR/topology-stable-$ts_slot"
+    ts_reset() { printf '0 0 0\n' > "$ts_streak"; }
+    ts_has_slot() { case ",$1," in *",$2,"*) return 0;; esac; return 1; }
+    ts_get() { sed -n "s/^$1=//p" "$2" 2>/dev/null | tail -n1; }
+
+    if [ "$ts_healthy" != true ] || [ "$ts_quorum" -lt "${HTTPS_HEALTH_SUCCESS_QUORUM:-2}" ]; then
+        ts_reset
+        return 0
+    fi
+    ts_exhausted="$(ts_get exhausted_slots "$TOPOLOGY_FALLBACK")"
+    if ! ts_has_slot "$ts_exhausted" "$ts_slot"; then
+        ts_reset
+        return 0
+    fi
+    ts_count=0; ts_since=0; ts_last=0
+    if [ -f "$ts_streak" ]; then read -r ts_count ts_since ts_last < "$ts_streak" || true; fi
+    ts_count="$(uint_or_zero "$ts_count")"
+    ts_since="$(uint_or_zero "$ts_since")"
+    ts_last="$(uint_or_zero "$ts_last")"
+    if [ "$ts_since" -eq 0 ] || [ "$ts_now" -lt "$ts_last" ] || \
+       [ $((ts_now - ts_last)) -gt "$TOPOLOGY_MAX_GAP_SECONDS" ]; then
+        ts_since="$ts_now"
+        ts_count=0
+    fi
+    [ "$ts_count" -ge "$TOPOLOGY_STABLE_CYCLES" ] || ts_count=$((ts_count + 1))
+    printf '%s %s %s\n' "$ts_count" "$ts_since" "$ts_now" > "$ts_streak"
+    [ "$ts_count" -ge "$TOPOLOGY_STABLE_CYCLES" ] || return 0
+    [ $((ts_now - ts_since)) -ge "$TOPOLOGY_STABLE_SECONDS" ] || return 0
+
+    # Do not un-exhaust a slot while an outage, direct fallback, delivery
+    # backlog or competing recovery is in progress.  The next health tick
+    # will retry if the exclusion is still present.
+    [ ! -e "$TOPOLOGY_DIRECT" ] || return 0
+    [ "$(ts_get mode "$TOPOLOGY_FALLBACK")" = SLOT_EXHAUSTED ] || return 0
+    [ "$(ts_get exhausted_slots "$TOPOLOGY_WATCHER")" = "$ts_exhausted" ] || return 0
+    [ -z "$(ts_get pending_generation "$TOPOLOGY_DELIVERY")" ] || return 0
+    [ "$(ts_get last_attempt_result "$TOPOLOGY_DELIVERY")" = ACK_ACCEPTED ] || return 0
+    [ -x "$TOPOLOGY_SYNC" ] && [ -x "$TOPOLOGY_SLOTS_STATUS" ] || return 0
+    . "$STATE_HELPER"
+    ts_lock="$(reg_lock_acquire recovery-coordinator.lock watcher-stable-topology 2>/dev/null || true)"
+    [ -n "$ts_lock" ] || return 0
+    trap 'reg_lock_release "$ts_lock" >/dev/null 2>&1 || true' EXIT
+    [ "$(reg_get_state mode UNKNOWN 2>/dev/null || echo UNKNOWN)" = NORMAL ] || return 0
+    # Re-check under the coordinator lock, then corroborate the watcher HTTPS
+    # series with an independent fresh per-slot strict routing/ICMP oracle.
+    ts_exhausted="$(ts_get exhausted_slots "$TOPOLOGY_FALLBACK")"
+    ts_has_slot "$ts_exhausted" "$ts_slot" || return 0
+    ts_status="$($TOPOLOGY_SLOTS_STATUS 2>&1)" || true
+    printf '%s\n' "$ts_status" | grep -F '"slot":"'"$ts_slot"'"' | \
+      grep -q '"iface_exists":true,"route_ok":true,"rule_ok":true,"strict_ok":true,"status":"healthy"' || return 0
+    ts_out="$("$TOPOLOGY_SYNC" --bridge-clear "$ts_slot" watcher_stable_health 2>&1)" || {
+        event_emit topology_stable_clear_failed "slot=$ts_slot" "reason=sync_failed"
+        return 0
+    }
+    if printf '%s\n' "$ts_out" | grep -qx 'RESULT=PASS_WATCHER_TOPOLOGY_SYNC' && \
+       printf '%s\n' "$ts_out" | grep -qx "SLOT=$ts_slot" && \
+       printf '%s\n' "$ts_out" | grep -qx 'OUTBOX_RC=0'; then
+        event_emit topology_stable_clear "slot=$ts_slot" "stable_cycles=$ts_count" "stable_seconds=$((ts_now-ts_since))" "delivery=queued"
+        ts_reset
+    else
+        event_emit topology_stable_clear_uncertain "slot=$ts_slot" "reason=unexpected_sync_result"
+    fi
+    return 0
+)
+
 run_once() {
     health_log_bound || true
     now="$(date +%s)"
@@ -178,10 +261,12 @@ run_once() {
             fail_count=0
             echo 0 >"$fail_file"
             decision=healthy
+            topology_stable_health_step "$slot" true "$https_quorum" "$now" || true
             if [ "$previous_fail_count" -gt 0 ]; then
                 event_emit health_recovered "slot=$slot" "iface=$iface" "identity=$sm_identity" "endpoint=$sm_endpoint"                     "previous_fail_count=$previous_fail_count" "https_quorum=$https_quorum/3"                     "google=$pm_google" "cloudflare=$pm_cloudflare" "mozilla=$pm_mozilla"
             fi
         else
+            topology_stable_health_step "$slot" false "$https_quorum" "$now" || true
             fail_count=$((fail_count + 1))
             echo "$fail_count" >"$fail_file"
             if [ "$fail_count" -eq 1 ]; then

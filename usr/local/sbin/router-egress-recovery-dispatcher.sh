@@ -40,15 +40,22 @@ log_line() {
     printf '%s\t%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" "$1" >> "$LOG" 2>/dev/null || true
 }
 
+# Topology is an execution boundary, not a planning boundary.  In
+# particular, the watcher calls us in --dry-run before every commit.  A
+# refused dry-run must never leave an otherwise working slot exhausted.
+commit_requested=false
+for arg in "$@"; do
+    case "$arg" in --commit|--apply) commit_requested=true ;; esac
+done
 slot="$(find_slot "$@" 2>/dev/null || true)"
-if [ -n "$slot" ] && [ -x "$SYNC" ]; then
+if [ "$commit_requested" = true ] && [ -n "$slot" ] && [ -x "$SYNC" ]; then
     "$SYNC" --bridge-start "$slot" watcher_dispatch_start >> "$LOG" 2>&1 || log_line "bridge_start_failed slot=$slot rc=$?"
 fi
 
 "$CORE" "$@"
 rc=$?
 
-if [ -n "$slot" ] && [ -x "$SYNC" ]; then
+if [ "$commit_requested" = true ] && [ -n "$slot" ] && [ -x "$SYNC" ]; then
     if [ "$rc" -eq 0 ]; then
         "$SYNC" --bridge-clear "$slot" watcher_dispatch_success >> "$LOG" 2>&1 || log_line "bridge_clear_failed slot=$slot rc=$?"
     else
